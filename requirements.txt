@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+sqlalchemy
+asyncpg
+psycopg2-binary
+pydantic
+python-dotenv
+passlib
+python-jose
+requests
+pytest
+python-multipart
+alembic
+argon2-cffi
