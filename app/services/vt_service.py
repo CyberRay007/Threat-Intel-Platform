@@ -1,5 +1,6 @@
 import base64
 import requests
+from typing import Dict, Any
 
 from app.config import VT_API_KEY
 
@@ -50,3 +51,15 @@ def lookup_file_hash(sha256: str) -> Dict[str, Any]:
     data = resp.json()
     stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
     return {"raw": data, "stats": stats}
+
+
+def upload_file(file_content: bytes, filename: str) -> Dict[str, Any]:
+    """Upload file to VirusTotal for analysis."""
+    if not VT_API_KEY:
+        return {}
+    url = "https://www.virustotal.com/api/v3/files"
+    headers = {"x-apikey": VT_API_KEY}
+    files = {"file": (filename, file_content)}
+    resp = requests.post(url, headers=headers, files=files, timeout=30)
+    data = resp.json()
+    return {"raw": data}

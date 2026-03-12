@@ -12,3 +12,8 @@ pytest
 python-multipart
 alembic
 argon2-cffi
+python-whois
+scipy
+python-magic-bin
+celery
+redis

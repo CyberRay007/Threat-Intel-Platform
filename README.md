@@ -1,236 +1,313 @@
-# Threat Intel Platform
+Threat Intelligence Platform
 
-A comprehensive threat intelligence platform built with **FastAPI** and **PostgreSQL** for analyzing domains, URLs, and IOCs with risk scoring, behavioral analysis, and VirusTotal integration.
+A modular threat intelligence and detection platform built with FastAPI, PostgreSQL, Redis, and Celery.
 
-## 📋 Table of Contents
+The platform ingests open threat intelligence feeds, normalizes indicators of compromise (IOCs), and correlates them with user scans and operational events to produce explainable risk scores and detection alerts.
 
-- [Features](#features)
-- [Tech Stack](#tech-stack)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Running the Application](#running-the-application)
-- [Architecture](#architecture)
-- [API Documentation](#api-documentation)
-- [Contributing](#contributing)
-- [Security](#security)
-- [License](#license)
+The system demonstrates how modern threat intelligence platforms are built using asynchronous pipelines, external enrichment sources, and multi-signal scoring.
 
-## ✨ Features
+System Architecture
 
-- **Intelligence Gathering**: Scan domains, URLs, and IOCs for threat analysis
-- **Risk Scoring**: Dynamic, explainable scoring algorithm based on multiple factors
-- **Behavioral Analysis**: Detect homograph attacks, entropy analysis, and similarity matching
-- **VirusTotal Integration**: Real-time malware detection and threat intelligence
-- **Async Processing**: Background task queue using Celery for scalable processing
-- **JWT Authentication**: Secure token-based API authentication
-- **Database Migrations**: Alembic-based schema management
-- **API Rate Limiting**: Protected endpoints with configurable rate limits
+The platform consists of four primary subsystems.
 
-## 🛠 Tech Stack
+Component	Responsibility
+Scan Engine	Analyzes domains, URLs, and files
+Intel Pipeline	Ingests and normalizes threat feeds
+Detection Engine	Matches operational events against IOC database
+Alerting System	Aggregates and manages detection alerts
 
-- **Backend**: FastAPI (Python 3.8+)
-- **Database**: PostgreSQL with SQLAlchemy ORM
-- **Task Queue**: Celery for async processing
-- **Authentication**: JWT (PyJWT)
-- **Password Hashing**: Argon2
-- **API**: RESTful API with automatic Swagger documentation
-- **Database Migrations**: Alembic
+Architecture overview:
 
-## 📦 Prerequisites
+                   +-------------------+
+                   |  Threat Feeds     |
+                   | (URLHaus, OTX...) |
+                   +---------+---------+
+                             |
+                             v
+                   +-------------------+
+                   | IOC Normalization |
+                   |  & Storage        |
+                   +---------+---------+
+                             |
+                             v
+        +---------------------------+
+        |        IOC Database       |
+        +-------------+-------------+
+                      |
+                      v
+      +------------------------------+
+      |     Detection Engine         |
+      | (Celery async processing)    |
+      +-------------+----------------+
+                    |
+                    v
+           +-------------------+
+           |       Alerts      |
+           +-------------------+
 
-Before you begin, ensure you have the following installed:
+User scans feed into the same intelligence layer:
 
-- **Python 3.8+**
-- **PostgreSQL 12+** (or another supported database)
-- **pip** package manager
-- **Git** version control
+User Scan → Scan Engine → Intel Correlation → Risk Score
+Core Capabilities
 
-## 🚀 Installation
+Threat Analysis
 
-### 1. Clone the Repository
+• Domain and URL scanning
+• File hash intelligence lookup
+• VirusTotal enrichment
+• Structural phishing detection signals
 
-```bash
-git clone https://github.com/yourusername/threat-intel-platform.git
-cd threat-intel-platform
-```
+Threat Intelligence
 
-### 2. Create Virtual Environment
+• Multi-source IOC ingestion
+• IOC normalization and deduplication
+• Graph relationships between indicators and campaigns
 
-```powershell
-# Windows (PowerShell)
+Detection Pipeline
+
+• Event ingestion API
+• Asynchronous detection workers
+• IOC matching against events
+• Alert aggregation and fingerprinting
+
+Risk Intelligence
+
+• Multi-signal scoring model
+• Historical domain behavior signals
+• Feed intelligence correlation
+
+Roadmap Implementation
+
+The repository follows a staged development roadmap.
+
+Week 1
+Authentication and user management using JWT.
+
+Week 2
+Scan engine with domain and URL analysis and VirusTotal integration.
+
+Week 3
+Structural intelligence signals and IOC correlation.
+
+Week 4
+Large scale ingestion of open threat intelligence feeds.
+
+Week 5
+Detection engine with event ingestion, IOC matching, and alert aggregation.
+
+Week 6
+Multi-signal risk scoring using historical behavior and feed intelligence.
+
+Detection Workflow
+
+The detection pipeline operates asynchronously.
+
+Client Event
+     |
+     v
+POST /api/detection/events
+     |
+     v
+Event stored in database
+     |
+     v
+Celery worker processes event
+     |
+     v
+IOC matching against intelligence database
+     |
+     v
+Alert created or aggregated
+
+Alert aggregation prevents duplicate alerts by fingerprinting observables.
+
+Example fingerprint:
+
+sha256(observable_type + observable_value)
+Threat Intelligence Sources
+
+Integrated open intelligence feeds.
+
+Feed	Data Type
+PhishTank	Phishing URLs
+OpenPhish	Phishing URLs
+MalwareBazaar	Malware hashes
+Abuse.ch URLHaus	Malware URLs
+EmergingThreats	Malicious domains and IPs
+
+Optional feed
+
+AlienVault OTX (requires API key)
+
+External enrichment
+
+VirusTotal
+
+Technology Stack
+
+Backend
+
+Python
+FastAPI
+SQLAlchemy (Async ORM)
+
+Data Layer
+
+PostgreSQL
+
+Async Processing
+
+Celery
+Redis
+
+Security
+
+JWT Authentication
+
+Data Validation
+
+Pydantic
+
+Project Structure
+app
+ ├── api
+ │    ├── routes_auth.py
+ │    ├── routes_dashboard.py
+ │    ├── routes_detection.py
+ │    ├── routes_intel.py
+ │    └── routes_scan.py
+ │
+ ├── core
+ ├── database
+ ├── schemas
+ ├── services
+ ├── tasks
+ └── utils
+
+docker
+migrations
+
+init_db.py
+apply_schema_changes.py
+feed_ingestion.py
+
+Key directories
+
+api
+Contains REST API routes.
+
+services
+Core business logic including threat analysis and intelligence processing.
+
+tasks
+Celery workers for asynchronous jobs.
+
+schemas
+Pydantic request and response models.
+
+Setup
+
+Clone the repository
+
+git clone https://github.com/CyberRay007/Threat-Intel-Platform.git
+cd Threat-Intel-Platform
+
+Create virtual environment
+
+Windows PowerShell
+
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# macOS/Linux
-python -m venv .venv
-source .venv/bin/activate
-```
+Install dependencies
 
-### 3. Install Dependencies
-
-```bash
 pip install -r requirements.txt
-```
+Environment Configuration
 
-### 4. Configure Environment Variables
+Create .env file.
 
-Copy the example environment file and update with your actual values:
+DATABASE_URL=postgresql://threat_user:password@localhost:5432/threat_intel_db
 
-```bash
-copy .env.example .env
-```
+VT_API_KEY=your_virustotal_key
+OTX_API_KEY=your_otx_key
 
-Edit `.env` with your configuration:
-
-```ini
-# Database
-DATABASE_URL=postgresql://username:password@localhost:5432/threat_intel_db
-
-# VirusTotal API (get from https://www.virustotal.com/gui/home/upload)
-VT_API_KEY=your_api_key_here
-
-# JWT Security
-SECRET_KEY=your-secret-key-min-32-characters-long
+SECRET_KEY=replace-with-long-random-secret
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 
-# Application
 DEBUG=false
 LOG_LEVEL=info
-```
 
-**⚠️ Important**: Never commit `.env` file. Use `.env.example` as a template.
+CELERY_BROKER_URL=redis://localhost:6379/0
+CELERY_RESULT_BACKEND=redis://localhost:6379/0
+Database Initialization
+python init_db.py
+python apply_schema_changes.py
+Running the Platform
 
-### 5. Initialize Database
+Start API server
 
-```powershell
-# Create database tables
-.venv\Scripts\python.exe init_db.py
+uvicorn app.main:app --reload
 
-# Apply migrations (optional if using alembic)
-.venv\Scripts\python.exe apply_schema_changes.py
-```
+Start Celery worker
 
-## ▶️ Running the Application
-
-### Development Server
-
-```powershell
-.venv\Scripts\python.exe -m uvicorn app.main:app --reload --log-level debug
-```
-
-Server will start at: `http://localhost:8000`
-
-### API Documentation
-
-- **Swagger UI**: `http://localhost:8000/docs`
-- **ReDoc**: `http://localhost:8000/redoc`
-
-### Background Tasks (Celery Worker)
-
-```powershell
 celery -A app.tasks.celery_worker worker --loglevel=info
-```
 
-## 🏗 Architecture
+Run IOC feed ingestion manually
 
-```
-app/
-├── api/               # API endpoints
-│   ├── routes_auth.py         # Authentication routes
-│   ├── routes_dashboard.py    # Dashboard endpoints
-│   └── routes_scan.py         # Scan operations
-├── core/              # Core utilities
-│   ├── jwt.py                 # JWT token handling
-│   ├── security.py            # Security utilities
-│   └── logging.py             # Logging configuration
-├── database/          # Database layer
-│   ├── models.py              # SQLAlchemy models
-│   └── session.py             # Database session management
-├── schemas/           # Pydantic validation schemas
-│   ├── auth_schema.py
-│   └── scan_schema.py
-├── services/          # Business logic
-│   ├── behavior_engine.py     # Behavioral analysis
-│   ├── domain_engine.py       # Domain intelligence
-│   ├── exploit_engine.py      # Exploit detection
-│   ├── ioc_service.py         # IOC processing
-│   ├── risk_engine.py         # Risk scoring
-│   ├── vt_service.py          # VirusTotal integration
-│   └── orchestrator.py        # Orchestrate services
-├── tasks/             # Async tasks
-│   ├── celery_worker.py       # Celery configuration
-│   └── scan_tasks.py          # Scan task definitions
-├── utils/             # Helper utilities
-│   ├── entropy.py             # Entropy calculation
-│   ├── homograph.py           # Homograph detection
-│   └── similarity.py          # String similarity
-└── main.py            # Application entry point
-```
+python feed_ingestion.py
+API Documentation
 
-## 🔌 API Endpoints
+Swagger
 
-### Authentication
+http://localhost:8000/docs
 
-- `POST /api/auth/signup` - Register new user
-- `POST /api/auth/login` - Authenticate user
+ReDoc
 
-### Scanning
+http://localhost:8000/redoc
+Example Scan Response
 
-- `POST /api/scan/domain` - Scan and analyze a domain
-- `POST /api/scan/url` - Scan and analyze a URL
-- `POST /api/scan/ioc` - Analyze indicators of compromise
-- `GET /api/scan/{scan_id}` - Retrieve scan results
+Example domain scan result.
 
-### Dashboard
+{
+  "domain": "example-phish.com",
+  "risk_score": 82,
+  "signals": {
+    "structural_score": 25,
+    "ioc_score": 20,
+    "vt_score": 15,
+    "feed_intel_score": 12,
+    "historical_score": 10
+  },
+  "verdict": "malicious"
+}
+Security Best Practices
 
-- `GET /api/dashboard/summary` - Get platform summary
-- `GET /api/dashboard/stats` - Get threat statistics
+Never commit .env files.
 
-## 🔒 Security Considerations
+Rotate exposed API keys immediately.
 
-### Do NOT Commit
+Use strong secret keys for JWT signing.
 
-- ❌ `.env` file with credentials
-- ❌ API keys or secrets
-- ❌ Database passwords
-- ❌ Virtual environment (`venv/`, `.venv/`)
-- ❌ Session tokens or temporary auth files
+Disable debug mode outside development.
 
-### Best Practices
+Future Improvements
 
-✅ Use `.env.example` as template with placeholder values  
-✅ Use strong `SECRET_KEY` for JWT (minimum 32 characters)  
-✅ Enable `DEBUG=false` in production  
-✅ Use environment-specific `.env` files for different deployments  
-✅ Rotate API keys regularly  
-✅ Use HTTPS for all production endpoints  
-✅ Implement rate limiting on sensitive endpoints  
+Planned enhancements include:
 
-## 📝 Notes
+• threat actor attribution
+• campaign clustering
+• graph-based IOC relationships
+• streaming detection pipeline
+• machine learning risk scoring
 
-- The service performs metadata analysis only (no content fetching)
-- Scoring algorithm is deterministic and explainable; easily replaced with ML models
-- Respect VirusTotal API rate limits: [VirusTotal Free API](https://www.virustotal.com/gui/home/upload)
-- Database models support `scan_results` table and `file_scans` table for comprehensive logging
+Maintainer
 
-## 🤝 Contributing
+Raymond Favour
 
-1. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-2. Commit your changes (`git commit -m 'Add AmazingFeature'`)
-3. Push to the branch (`git push origin feature/AmazingFeature`)
-4. Open a Pull Request
+GitHub
+https://github.com/CyberRay007
 
-## 📄 License
+License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 📞 Support
-
-For issues, questions, or suggestions, please open an issue on GitHub.
-
----
-
-**Last Updated**: March 2026  
-**Maintainer**: Raymond Favour
+MIT License
