@@ -14,7 +14,7 @@ load_dotenv()
 # look up URL in environment or use default
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://threat_user:Culjeo143478@localhost:5432/threat_intel_db",
+    "postgresql://threat_user:password@localhost:5432/threat_intel_db",
 )
 
 # convert to asyncpg dialect if using Postgres

@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from datetime import datetime
 
 from app.database.session import get_db
@@ -11,6 +12,30 @@ from app.tasks.scan_tasks import process_scan, process_file_scan
 
 
 router = APIRouter()
+
+
+@router.get("/", summary="List scans for current user")
+async def list_scans(
+    status: Optional[str] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    offset = (page - 1) * limit
+    base = select(Scan).where(Scan.user_id == current_user.id)
+    count_q = select(func.count()).select_from(Scan).where(Scan.user_id == current_user.id)
+    if status:
+        base = base.where(Scan.status == status)
+        count_q = count_q.where(Scan.status == status)
+    rows = await db.execute(base.order_by(Scan.created_at.desc()).limit(limit).offset(offset))
+    total = await db.execute(count_q)
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total.scalar_one(),
+        "scans": rows.scalars().all(),
+    }
 
 
 @router.post("/scan", response_model=ScanResponse)
@@ -34,7 +59,19 @@ async def submit_scan(
     # schedule background processing
     background_tasks.add_task(process_scan, scan.id)
 
-    return scan
+    return ScanResponse(
+        id=scan.id,
+        target_url=scan.target_url,
+        status=scan.status,
+        structural_score=scan.structural_score,
+        vt_score=scan.vt_score,
+        feed_intel_score=scan.feed_intel_score,
+        historical_score=scan.historical_score,
+        risk_score=scan.risk_score,
+        created_at=scan.created_at,
+        completed_at=scan.completed_at,
+        result=None,
+    )
 
 
 @router.get("/scan/{scan_id}", response_model=ScanResponse)

@@ -107,6 +107,48 @@ async def main():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ioc_relationships_malware_family_id ON ioc_relationships(malware_family_id)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ioc_relationships_campaign_id ON ioc_relationships(campaign_id)"))
 
+        # IOC graph edges (IOC -> IOC) for relationship investigations.
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS ioc_graph_relationships (
+            id serial PRIMARY KEY,
+            source_ioc_id integer NOT NULL REFERENCES ioc(id),
+            target_ioc_id integer NOT NULL REFERENCES ioc(id),
+            relationship_type varchar NOT NULL,
+            confidence integer DEFAULT 50,
+            created_at timestamp without time zone DEFAULT now()
+        )
+        """))
+        await conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_ioc_graph_relationship
+        ON ioc_graph_relationships(source_ioc_id, target_ioc_id, relationship_type)
+        """))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ioc_graph_source ON ioc_graph_relationships(source_ioc_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ioc_graph_target ON ioc_graph_relationships(target_ioc_id)"))
+
+        # Detection rules for behavioral detections.
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS detection_rules (
+            id serial PRIMARY KEY,
+            name varchar NOT NULL,
+            description text DEFAULT '',
+            rule_type varchar NOT NULL,
+            severity varchar NOT NULL DEFAULT 'low',
+            enabled boolean NOT NULL DEFAULT true,
+            created_at timestamp without time zone DEFAULT now()
+        )
+        """))
+        await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_detection_rules_name ON detection_rules(name)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_detection_rules_rule_type ON detection_rules(rule_type)"))
+        await conn.execute(text("""
+        INSERT INTO detection_rules(name, description, rule_type, severity, enabled)
+        VALUES
+            ('Suspicious TLD', 'Domain uses risky top-level domain', 'suspicious_tld', 'medium', true),
+            ('High Entropy Domain', 'Domain entropy suggests algorithmic generation', 'high_entropy_domain', 'high', true),
+            ('Phishing Keyword Domain', 'Domain includes common phishing lure keywords', 'phishing_keyword_domain', 'medium', true),
+            ('Homoglyph Domain', 'Domain looks like a homoglyph or punycode impersonation', 'homoglyph_domain', 'high', true)
+        ON CONFLICT (name) DO NOTHING
+        """))
+
         # Ensure IOC foreign key points to the canonical threat_actors table.
         await conn.execute(text("""
         DO $$
@@ -165,7 +207,6 @@ async def main():
         await conn.execute(text("""
         CREATE TABLE IF NOT EXISTS alerts (
             id serial PRIMARY KEY,
-            event_id integer references events(id),
             fingerprint varchar,
             observable_type varchar,
             observable_value varchar,
@@ -191,7 +232,18 @@ async def main():
         await conn.execute(text("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS fingerprint varchar"))
         await conn.execute(text("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS observable_type varchar"))
         await conn.execute(text("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS observable_value varchar"))
-        await conn.execute(text("ALTER TABLE alerts ALTER COLUMN event_id DROP NOT NULL"))
+        await conn.execute(text("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'alerts' AND column_name = 'event_id'
+            ) THEN
+                ALTER TABLE alerts ALTER COLUMN event_id DROP NOT NULL;
+            END IF;
+        END $$;
+        """))
         await conn.execute(text("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS first_seen_at timestamp without time zone DEFAULT now()"))
         await conn.execute(text("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_seen_at timestamp without time zone DEFAULT now()"))
         await conn.execute(text("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_count integer DEFAULT 1"))
@@ -213,7 +265,18 @@ async def main():
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_events_url ON events(url)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_events_ip ON events(ip)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_events_file_hash ON events(file_hash)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alerts_event_id ON alerts(event_id)"))
+        await conn.execute(text("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'alerts' AND column_name = 'event_id'
+            ) THEN
+                CREATE INDEX IF NOT EXISTS ix_alerts_event_id ON alerts(event_id);
+            END IF;
+        END $$;
+        """))
         await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_alerts_fingerprint ON alerts(fingerprint)"))
         # Canonicalize legacy IOC type values.
         await conn.execute(text("""

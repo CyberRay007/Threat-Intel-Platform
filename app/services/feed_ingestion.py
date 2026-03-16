@@ -14,7 +14,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.database.models import IOC, IOCRelationship, ThreatActor, MalwareFamily, Campaign
+from app.database.models import IOC, IOCRelationship, IOCGraphRelationship, ThreatActor, MalwareFamily, Campaign
 
 
 SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
@@ -429,7 +429,7 @@ async def _attach_graph_relationships(
         return 0
 
     inserted = 0
-    for rel_batch in _row_chunks(rows_to_insert, 500):
+    for rel_batch in _row_chunks(rows_to_insert, 100):
         stmt = (
             pg_insert(IOCRelationship)
             .values(rel_batch)
@@ -439,6 +439,67 @@ async def _attach_graph_relationships(
         )
         rel_result = await db.execute(stmt)
         inserted += int(rel_result.rowcount or 0)
+
+    return inserted
+
+
+async def _attach_ioc_graph_edges(
+    db: AsyncSession,
+    indicators: List[Tuple[str, str]],
+) -> int:
+    """Create IOC->IOC edges for graph investigations (e.g., URL -> DOMAIN)."""
+    url_to_domain: List[Tuple[str, str]] = []
+    domain_set = {v for t, v in indicators if t == "domain"}
+    for ioc_type, value in indicators:
+        if ioc_type != "url":
+            continue
+        try:
+            parsed = urlparse(value)
+            host = (parsed.netloc or "").lower().strip(".")
+            if host and host in domain_set:
+                url_to_domain.append((value, host))
+        except Exception:
+            continue
+
+    if not url_to_domain:
+        return 0
+
+    unique_values = sorted({v for pair in url_to_domain for v in pair})
+    value_to_id: Dict[str, int] = {}
+    for value_part in _chunks(unique_values, 500):
+        rows = await db.execute(select(IOC.id, IOC.value).where(IOC.value.in_(value_part)))
+        for ioc_id, ioc_value in rows.all():
+            value_to_id[ioc_value] = ioc_id
+
+    edge_rows: List[Dict[str, Any]] = []
+    for src_url, dst_domain in url_to_domain:
+        src_id = value_to_id.get(src_url)
+        dst_id = value_to_id.get(dst_domain)
+        if not src_id or not dst_id or src_id == dst_id:
+            continue
+        edge_rows.append(
+            {
+                "source_ioc_id": src_id,
+                "target_ioc_id": dst_id,
+                "relationship_type": "shares_infrastructure",
+                "confidence": 70,
+            }
+        )
+
+    if not edge_rows:
+        return 0
+
+    inserted = 0
+    for batch in _row_chunks(edge_rows, 100):
+        stmt = (
+            pg_insert(IOCGraphRelationship)
+            .values(batch)
+            .on_conflict_do_nothing(
+                index_elements=["source_ioc_id", "target_ioc_id", "relationship_type"]
+            )
+        )
+        result = await db.execute(stmt)
+        inserted += int(result.rowcount or 0)
 
     return inserted
 
@@ -487,7 +548,12 @@ async def ingest_source(
 
         result.normalized = len(normalized)
         result.inserted = await _insert_missing_iocs(db, source=source, indicators=normalized)
-        await _attach_graph_relationships(db, source=source, indicators=normalized)
+        try:
+            await _attach_graph_relationships(db, source=source, indicators=normalized)
+            await _attach_ioc_graph_edges(db, indicators=normalized)
+        except Exception as rel_exc:
+            # Keep IOC ingestion successful even if relationship enrichment fails.
+            result.error_message = f"relationship_enrichment_failed: {rel_exc}"
         await db.commit()
         return result
     except Exception as exc:

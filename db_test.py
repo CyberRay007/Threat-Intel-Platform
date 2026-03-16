@@ -3,7 +3,7 @@ from sqlalchemy import create_engine, text
 
 
 DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql://threat_user:Culjeo143478@localhost:5432/threat_intel_db"
+    "DATABASE_URL", "postgresql://threat_user:password@localhost:5432/threat_intel_db"
 )
 
 

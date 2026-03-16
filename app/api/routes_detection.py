@@ -117,6 +117,7 @@ async def list_alerts(
 
 
 @router.get("/detection/alerts/{alert_id}/investigation", response_model=AlertInvestigationResponse)
+@router.get("/detection/alerts/{alert_id}/investigate", response_model=AlertInvestigationResponse)
 async def investigate_alert(
     alert_id: int,
     events_limit: int = 50,
@@ -224,6 +225,62 @@ async def investigate_alert(
         ioc_matches=ioc_matches,
         threat_actor_attribution=actor_rows,
     )
+
+
+@router.get("/detection/events")
+async def list_events(
+    status: str | None = None,
+    event_type: str | None = None,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    page: int = 1,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    limit = max(1, min(limit, 500))
+    page = max(1, page)
+    offset = (page - 1) * limit
+
+    base = select(Event)
+    count_q = select(func.count()).select_from(Event)
+
+    if status:
+        base = base.where(Event.status == status)
+        count_q = count_q.where(Event.status == status)
+    if event_type:
+        base = base.where(Event.event_type == event_type)
+        count_q = count_q.where(Event.event_type == event_type)
+    if start_date:
+        base = base.where(Event.created_at >= start_date)
+        count_q = count_q.where(Event.created_at >= start_date)
+    if end_date:
+        base = base.where(Event.created_at <= end_date)
+        count_q = count_q.where(Event.created_at <= end_date)
+
+    rows = await db.execute(base.order_by(Event.created_at.desc()).limit(limit).offset(offset))
+    total = await db.execute(count_q)
+
+    items = [
+        {
+            "id": e.id,
+            "timestamp": e.created_at,
+            "source": e.source,
+            "event_type": e.event_type,
+            "status": e.status,
+            "observable": e.domain or e.url or e.ip or e.file_hash,
+            "detection_result": "alerted" if e.alert_id else "clean",
+            "alert_id": e.alert_id,
+        }
+        for e in rows.scalars().all()
+    ]
+
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total.scalar_one(),
+        "events": items,
+    }
 
 
 @router.post("/detection/alerts/{alert_id}/triage", response_model=AlertTriageResponse)

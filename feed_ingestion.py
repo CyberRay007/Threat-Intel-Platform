@@ -1,8 +1,12 @@
 import asyncio
 import os
+from dotenv import load_dotenv
 
 from app.database.session import AsyncSessionLocal
 from app.services.feed_ingestion import ingest_all_sources
+
+
+load_dotenv()
 
 
 async def main():

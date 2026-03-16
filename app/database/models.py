@@ -1,5 +1,5 @@
 # app/database/models.py
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON, Text, UniqueConstraint
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON, Text, UniqueConstraint, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -119,6 +119,16 @@ class IOC(Base):
 
     threat_actor = relationship("ThreatActor", back_populates="iocs")
     relationships = relationship("IOCRelationship", back_populates="ioc")
+    outgoing_graph_relationships = relationship(
+        "IOCGraphRelationship",
+        foreign_keys="IOCGraphRelationship.source_ioc_id",
+        back_populates="source_ioc",
+    )
+    incoming_graph_relationships = relationship(
+        "IOCGraphRelationship",
+        foreign_keys="IOCGraphRelationship.target_ioc_id",
+        back_populates="target_ioc",
+    )
 
 
 class Event(Base):
@@ -219,3 +229,39 @@ class IOCRelationship(Base):
     threat_actor = relationship("ThreatActor", back_populates="ioc_relationships")
     malware_family = relationship("MalwareFamily", back_populates="ioc_relationships")
     campaign = relationship("Campaign", back_populates="ioc_relationships")
+
+
+class IOCGraphRelationship(Base):
+    """IOC-to-IOC relationships for graph investigation queries."""
+
+    __tablename__ = "ioc_graph_relationships"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_ioc_id",
+            "target_ioc_id",
+            "relationship_type",
+            name="uq_ioc_graph_relationship",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_ioc_id = Column(Integer, ForeignKey("ioc.id"), nullable=False, index=True)
+    target_ioc_id = Column(Integer, ForeignKey("ioc.id"), nullable=False, index=True)
+    relationship_type = Column(String, nullable=False)
+    confidence = Column(Integer, default=50)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    source_ioc = relationship("IOC", foreign_keys=[source_ioc_id], back_populates="outgoing_graph_relationships")
+    target_ioc = relationship("IOC", foreign_keys=[target_ioc_id], back_populates="incoming_graph_relationships")
+
+
+class DetectionRule(Base):
+    __tablename__ = "detection_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, unique=True, index=True)
+    description = Column(Text, default="")
+    rule_type = Column(String, nullable=False, index=True)
+    severity = Column(String, nullable=False, default="low")
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
