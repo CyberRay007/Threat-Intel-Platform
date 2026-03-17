@@ -16,6 +16,7 @@ export default function EventStreamPage() {
   const [limit, setLimit] = useState(100);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [justSeenIds, setJustSeenIds] = useState<number[]>([]);
 
   useEffect(() => {
     let mounted = true;
@@ -25,7 +26,23 @@ export default function EventStreamPage() {
       try {
         const payload = await getEvents({ page, limit });
         if (!mounted) return;
-        setEvents(payload.events);
+
+        setEvents((previousEvents) => {
+          const previousTopId = previousEvents[0]?.id;
+          const currentTopId = payload.events[0]?.id;
+
+          if (previousTopId && currentTopId && currentTopId !== previousTopId) {
+            const newIds = payload.events
+              .filter((event) => event.id > previousTopId)
+              .slice(0, 12)
+              .map((event) => event.id);
+            setJustSeenIds(newIds);
+            setTimeout(() => setJustSeenIds([]), 2200);
+          }
+
+          return payload.events;
+        });
+
         setTotal(payload.total);
       } finally {
         if (mounted) setLoading(false);
@@ -62,6 +79,9 @@ export default function EventStreamPage() {
           />
           Auto refresh every 5s
         </label>
+        <span className="rounded-full border border-cyan-300/25 bg-cyan-300/10 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-cyan-100">
+          {autoRefresh ? "Live" : "Paused"}
+        </span>
         <div className="flex items-center gap-2 text-sm text-slate-300">
           <span>Rows</span>
           <select
@@ -95,7 +115,7 @@ export default function EventStreamPage() {
           </THead>
           <TBody>
             {events.map((event) => (
-              <TR key={event.id}>
+              <TR key={event.id} className={justSeenIds.includes(event.id) ? "bg-cyan-400/10" : ""}>
                 <TD>{formatDateTime(event.timestamp)}</TD>
                 <TD>{event.observable ?? "-"}</TD>
                 <TD>{event.event_type}</TD>

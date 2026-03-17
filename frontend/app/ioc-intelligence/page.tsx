@@ -124,6 +124,23 @@ export default function IOCIntelligencePage() {
                 <p className="font-mono text-slate-100">{selected.value}</p>
                 <p className="text-slate-400">Type: {selected.type}</p>
                 <p className="text-slate-400">Confidence: {selected.confidence}</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <span className="rounded border border-cyan-400/30 bg-cyan-400/10 px-2 py-0.5 text-[10px] uppercase tracking-wide text-cyan-200">
+                    feed:{selected.threat_type ?? "unknown"}
+                  </span>
+                  <span className="rounded border border-slate-600/80 bg-slate-800 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-200">
+                    ioc:{selected.type}
+                  </span>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
+                <p className="mb-2 text-xs uppercase tracking-wide text-slate-400">Attribution Snapshot</p>
+                {selected.relationships?.some((r) => String(r.entity_type) === "threat_actor") ? (
+                  <p className="text-slate-200">Linked threat actor entities detected via IOC relationship records.</p>
+                ) : (
+                  <p className="text-slate-400">No direct threat actor attribution in this IOC record.</p>
+                )}
               </div>
 
               <div className="rounded-lg border border-slate-800 bg-slate-900/80 p-3">

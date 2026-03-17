@@ -1,7 +1,8 @@
 import type { Metadata } from "next";
 import { IBM_Plex_Sans, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
-import { AppShell } from "@/components/layout/app-shell";
+import { RootShell } from "@/components/layout/root-shell";
+import { Providers } from "@/components/layout/providers";
 
 const plexSans = IBM_Plex_Sans({
   variable: "--font-plex-sans",
@@ -30,7 +31,9 @@ export default function RootLayout({
       <body
         className={`${plexSans.variable} ${jetbrainsMono.variable} antialiased`}
       >
-        <AppShell>{children}</AppShell>
+        <Providers>
+          <RootShell>{children}</RootShell>
+        </Providers>
       </body>
     </html>
   );

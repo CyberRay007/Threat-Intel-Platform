@@ -115,11 +115,11 @@ export default function AlertsConsolePage() {
   return (
     <div className="space-y-5">
       <div>
-        <h1 className="text-2xl font-semibold text-slate-100">Alerts Console</h1>
-        <p className="text-sm text-slate-400">Filter, prioritize, and pivot directly into investigations.</p>
+        <h1 className="text-2xl font-semibold text-cyan-50">Alerts Console</h1>
+        <p className="text-sm text-slate-300/75">Filter, prioritize, and pivot directly into investigations.</p>
       </div>
 
-      <section className="grid gap-3 rounded-xl border border-slate-800 bg-slate-950/70 p-4 md:grid-cols-2 lg:grid-cols-6">
+      <section className="siem-panel sticky top-4 z-20 grid gap-3 rounded-2xl p-4 md:grid-cols-2 lg:grid-cols-6">
         <Input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
@@ -166,7 +166,7 @@ export default function AlertsConsolePage() {
       {error ? <p className="text-sm text-red-300">{error}</p> : null}
       {loading ? <p className="text-sm text-slate-400">Loading alerts...</p> : null}
 
-      <section className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/70">
+      <section className="siem-panel overflow-x-auto rounded-2xl">
         <Table>
           <THead>
             {table.getHeaderGroups().map((headerGroup) => (
@@ -185,14 +185,20 @@ export default function AlertsConsolePage() {
             {table.getRowModel().rows.map((row) => (
               <TR
                 key={row.id}
-                className="cursor-pointer border-t border-slate-800 text-slate-200 hover:bg-slate-800/40"
+                className="cursor-pointer border-t border-cyan-100/10 text-slate-200 hover:bg-cyan-400/5"
                 onClick={() => setSelectedAlertId(row.original.id)}
               >
                 {row.getVisibleCells().map((cell) => (
                   <TD key={cell.id} className="py-3">
-                    {cell.column.columnDef.cell
-                      ? flexRender(cell.column.columnDef.cell, cell.getContext())
-                      : String(cell.getValue() ?? "-")}
+                    {cell.column.id === "status" ? (
+                      <span className="rounded border border-slate-600/75 bg-slate-800/80 px-2 py-1 text-[10px] uppercase tracking-wide text-slate-200">
+                        {String(cell.getValue() ?? "-")}
+                      </span>
+                    ) : cell.column.columnDef.cell ? (
+                      flexRender(cell.column.columnDef.cell, cell.getContext())
+                    ) : (
+                      String(cell.getValue() ?? "-")
+                    )}
                   </TD>
                 ))}
               </TR>
