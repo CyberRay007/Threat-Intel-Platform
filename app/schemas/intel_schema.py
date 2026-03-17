@@ -25,6 +25,10 @@ class IOCResponse(BaseModel):
     value: str
     threat_actor_id: Optional[int] = None
     source: Optional[str] = None
+    first_seen: Optional[datetime] = None
+    last_seen: Optional[datetime] = None
+    confidence: Optional[float] = None
+    source_reliability: Optional[float] = None
 
     class Config:
         from_attributes = True

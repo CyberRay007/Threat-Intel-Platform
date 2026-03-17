@@ -287,6 +287,90 @@ async def main():
         ON CONFLICT (type, value) DO NOTHING
         """))
         await conn.execute(text("DELETE FROM ioc WHERE type = 'hash'"))
+
+        # ----------------------------
+        # Multi-tenant + RBAC baseline
+        # ----------------------------
+        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS organizations (
+            id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+            name varchar NOT NULL,
+            created_at timestamp without time zone DEFAULT now()
+        )
+        """))
+        await conn.execute(text("""
+        INSERT INTO organizations(name)
+        SELECT 'default-org'
+        WHERE NOT EXISTS (SELECT 1 FROM organizations)
+        """))
+        await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS org_id uuid"))
+        await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role varchar DEFAULT 'analyst'"))
+        await conn.execute(text("UPDATE users SET org_id = (SELECT id FROM organizations ORDER BY created_at ASC LIMIT 1) WHERE org_id IS NULL"))
+        await conn.execute(text("ALTER TABLE users ALTER COLUMN org_id SET NOT NULL"))
+        await conn.execute(text("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_name='users' AND constraint_name='users_org_id_fkey') THEN ALTER TABLE users ADD CONSTRAINT users_org_id_fkey FOREIGN KEY (org_id) REFERENCES organizations(id); END IF; END $$;"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_org_id ON users(org_id)"))
+
+        for table in ["scans", "file_scans", "events", "alerts", "ioc", "threat_actors", "malware_families", "campaigns", "ioc_relationships", "ioc_graph_relationships"]:
+            await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS org_id uuid"))
+            await conn.execute(text(f"UPDATE {table} SET org_id = (SELECT id FROM organizations ORDER BY created_at ASC LIMIT 1) WHERE org_id IS NULL"))
+            await conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN org_id SET NOT NULL"))
+            await conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_org_id ON {table}(org_id)"))
+
+        await conn.execute(text("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_name='scans' AND constraint_name='scans_org_id_fkey') THEN ALTER TABLE scans ADD CONSTRAINT scans_org_id_fkey FOREIGN KEY (org_id) REFERENCES organizations(id); END IF; END $$;"))
+        await conn.execute(text("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_name='file_scans' AND constraint_name='file_scans_org_id_fkey') THEN ALTER TABLE file_scans ADD CONSTRAINT file_scans_org_id_fkey FOREIGN KEY (org_id) REFERENCES organizations(id); END IF; END $$;"))
+        await conn.execute(text("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_name='events' AND constraint_name='events_org_id_fkey') THEN ALTER TABLE events ADD CONSTRAINT events_org_id_fkey FOREIGN KEY (org_id) REFERENCES organizations(id); END IF; END $$;"))
+        await conn.execute(text("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_name='alerts' AND constraint_name='alerts_org_id_fkey') THEN ALTER TABLE alerts ADD CONSTRAINT alerts_org_id_fkey FOREIGN KEY (org_id) REFERENCES organizations(id); END IF; END $$;"))
+        await conn.execute(text("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE table_name='ioc' AND constraint_name='ioc_org_id_fkey') THEN ALTER TABLE ioc ADD CONSTRAINT ioc_org_id_fkey FOREIGN KEY (org_id) REFERENCES organizations(id); END IF; END $$;"))
+
+        await conn.execute(text("ALTER TABLE ioc ADD COLUMN IF NOT EXISTS first_seen timestamp without time zone DEFAULT now()"))
+        await conn.execute(text("ALTER TABLE ioc ADD COLUMN IF NOT EXISTS last_seen timestamp without time zone DEFAULT now()"))
+        await conn.execute(text("ALTER TABLE ioc ADD COLUMN IF NOT EXISTS confidence double precision DEFAULT 0.5"))
+        await conn.execute(text("ALTER TABLE ioc ADD COLUMN IF NOT EXISTS source_reliability double precision DEFAULT 0.5"))
+        await conn.execute(text("UPDATE ioc SET first_seen = COALESCE(first_seen, now()), last_seen = COALESCE(last_seen, now())"))
+
+        await conn.execute(text("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS assigned_to integer REFERENCES users(id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alerts_assigned_to ON alerts(assigned_to)"))
+
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id serial PRIMARY KEY,
+            org_id uuid NOT NULL REFERENCES organizations(id),
+            key_hash varchar NOT NULL UNIQUE,
+            permissions jsonb DEFAULT '[]'::jsonb,
+            last_used timestamp without time zone,
+            created_at timestamp without time zone DEFAULT now()
+        )
+        """))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_api_keys_org_id ON api_keys(org_id)"))
+
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS ioc_tags (
+            id serial PRIMARY KEY,
+            org_id uuid NOT NULL REFERENCES organizations(id),
+            ioc_id integer NOT NULL REFERENCES ioc(id),
+            tag varchar NOT NULL,
+            created_at timestamp without time zone DEFAULT now(),
+            CONSTRAINT uq_ioc_tag UNIQUE (ioc_id, tag)
+        )
+        """))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ioc_tags_org_id ON ioc_tags(org_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ioc_tags_tag ON ioc_tags(tag)"))
+
+        await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS alert_history (
+            id serial PRIMARY KEY,
+            org_id uuid NOT NULL REFERENCES organizations(id),
+            alert_id integer NOT NULL REFERENCES alerts(id),
+            action varchar NOT NULL,
+            performed_by integer NOT NULL REFERENCES users(id),
+            details jsonb DEFAULT '{}'::jsonb,
+            timestamp timestamp without time zone DEFAULT now()
+        )
+        """))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alert_history_org_id ON alert_history(org_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alert_history_alert_id ON alert_history(alert_id)"))
+
         print("Schema updates applied.")
 
 if __name__ == '__main__':

@@ -5,6 +5,7 @@ import csv
 import gzip
 import json
 import re
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -14,7 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.database.models import IOC, IOCRelationship, IOCGraphRelationship, ThreatActor, MalwareFamily, Campaign
+from app.database.models import IOC, IOCRelationship, IOCGraphRelationship, ThreatActor, MalwareFamily, Campaign, Organization
 
 
 SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
@@ -307,14 +308,34 @@ def _row_chunks(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[st
         yield items[i : i + size]
 
 
-async def _insert_missing_iocs(db: AsyncSession, source: str, indicators: List[Tuple[str, str]]) -> int:
+async def _get_or_create_default_org_id(db: AsyncSession):
+    row = await db.execute(select(Organization).order_by(Organization.created_at.asc()).limit(1))
+    org = row.scalar_one_or_none()
+    if org:
+        return org.id
+    org = Organization(name="system-default")
+    db.add(org)
+    await db.flush()
+    return org.id
+
+
+async def _insert_missing_iocs(db: AsyncSession, source: str, indicators: List[Tuple[str, str]], org_id) -> int:
     if not indicators:
         return 0
 
     inserted = 0
     for batch in _chunks(indicators, 300):
         rows = [
-            {"type": canonicalize_ioc_type(t), "value": v, "source": source}
+            {
+                "org_id": org_id,
+                "type": canonicalize_ioc_type(t),
+                "value": v,
+                "source": source,
+                "first_seen": datetime.utcnow(),
+                "last_seen": datetime.utcnow(),
+                "confidence": 0.7,
+                "source_reliability": 0.7,
+            }
             for t, v in batch
         ]
         stmt = pg_insert(IOC).values(rows).on_conflict_do_nothing(index_elements=["type", "value"])
@@ -326,25 +347,25 @@ async def _insert_missing_iocs(db: AsyncSession, source: str, indicators: List[T
     return inserted
 
 
-async def _upsert_named_entity(db: AsyncSession, entity_type: str, name: str) -> int:
+async def _upsert_named_entity(db: AsyncSession, entity_type: str, name: str, org_id) -> int:
     if entity_type == "threat_actor":
         stmt = (
             pg_insert(ThreatActor)
-            .values({"name": name})
+            .values({"name": name, "org_id": org_id})
             .on_conflict_do_update(index_elements=["name"], set_={"name": name})
             .returning(ThreatActor.id)
         )
     elif entity_type == "malware_family":
         stmt = (
             pg_insert(MalwareFamily)
-            .values({"name": name})
+            .values({"name": name, "org_id": org_id})
             .on_conflict_do_update(index_elements=["name"], set_={"name": name})
             .returning(MalwareFamily.id)
         )
     elif entity_type == "campaign":
         stmt = (
             pg_insert(Campaign)
-            .values({"name": name})
+            .values({"name": name, "org_id": org_id})
             .on_conflict_do_update(index_elements=["name"], set_={"name": name})
             .returning(Campaign.id)
         )
@@ -361,6 +382,7 @@ async def _attach_graph_relationships(
     db: AsyncSession,
     source: str,
     indicators: List[Tuple[str, str]],
+    org_id,
 ) -> int:
     cfg = GRAPH_SOURCE_MAP.get(source)
     if not cfg or not indicators:
@@ -368,7 +390,7 @@ async def _attach_graph_relationships(
 
     entity_type = cfg["entity"]
     relationship_type = cfg["relationship_type"]
-    entity_id = await _upsert_named_entity(db, entity_type=entity_type, name=cfg["name"])
+    entity_id = await _upsert_named_entity(db, entity_type=entity_type, name=cfg["name"], org_id=org_id)
 
     # Resolve IOC ids for normalized (type, value) pairs.
     by_type: Dict[str, List[str]] = {}
@@ -382,14 +404,16 @@ async def _attach_graph_relationships(
             db,
             entity_type="malware_family",
             name=DOMAIN_FAMILY_NAME,
+            org_id=org_id,
         )
     for ioc_type, values in by_type.items():
         for part in _chunks(values, 500):
             q = await db.execute(
-                select(IOC.id, IOC.type, IOC.value).where(IOC.type == ioc_type, IOC.value.in_(part))
+                select(IOC.id, IOC.type, IOC.value).where(IOC.type == ioc_type, IOC.value.in_(part), IOC.org_id == org_id)
             )
             for ioc_id, resolved_type, _ in q.all():
                 rel_row: Dict[str, Any] = {
+                    "org_id": org_id,
                     "ioc_id": ioc_id,
                     "relationship_type": relationship_type,
                     "related_entity_type": entity_type,
@@ -413,6 +437,7 @@ async def _attach_graph_relationships(
                 if domain_family_entity_id is not None and resolved_type == "domain":
                     rows_to_insert.append(
                         {
+                            "org_id": org_id,
                             "ioc_id": ioc_id,
                             "relationship_type": "associated_with_family",
                             "related_entity_type": "malware_family",
@@ -446,6 +471,7 @@ async def _attach_graph_relationships(
 async def _attach_ioc_graph_edges(
     db: AsyncSession,
     indicators: List[Tuple[str, str]],
+    org_id,
 ) -> int:
     """Create IOC->IOC edges for graph investigations (e.g., URL -> DOMAIN)."""
     url_to_domain: List[Tuple[str, str]] = []
@@ -467,7 +493,7 @@ async def _attach_ioc_graph_edges(
     unique_values = sorted({v for pair in url_to_domain for v in pair})
     value_to_id: Dict[str, int] = {}
     for value_part in _chunks(unique_values, 500):
-        rows = await db.execute(select(IOC.id, IOC.value).where(IOC.value.in_(value_part)))
+        rows = await db.execute(select(IOC.id, IOC.value).where(IOC.value.in_(value_part), IOC.org_id == org_id))
         for ioc_id, ioc_value in rows.all():
             value_to_id[ioc_value] = ioc_id
 
@@ -479,6 +505,7 @@ async def _attach_ioc_graph_edges(
             continue
         edge_rows.append(
             {
+                "org_id": org_id,
                 "source_ioc_id": src_id,
                 "target_ioc_id": dst_id,
                 "relationship_type": "shares_infrastructure",
@@ -510,7 +537,11 @@ async def ingest_source(
     limit: Optional[int] = None,
     timeout: int = 20,
     otx_api_key: Optional[str] = None,
+    org_id=None,
 ) -> FeedResult:
+    if org_id is None:
+        org_id = await _get_or_create_default_org_id(db)
+
     result = FeedResult(source=source)
     try:
         if FEEDS[source].get("requires_api_key") == "true" and not otx_api_key:
@@ -547,10 +578,10 @@ async def ingest_source(
                 result.skipped += 1
 
         result.normalized = len(normalized)
-        result.inserted = await _insert_missing_iocs(db, source=source, indicators=normalized)
+        result.inserted = await _insert_missing_iocs(db, source=source, indicators=normalized, org_id=org_id)
         try:
-            await _attach_graph_relationships(db, source=source, indicators=normalized)
-            await _attach_ioc_graph_edges(db, indicators=normalized)
+            await _attach_graph_relationships(db, source=source, indicators=normalized, org_id=org_id)
+            await _attach_ioc_graph_edges(db, indicators=normalized, org_id=org_id)
         except Exception as rel_exc:
             # Keep IOC ingestion successful even if relationship enrichment fails.
             result.error_message = f"relationship_enrichment_failed: {rel_exc}"
@@ -568,6 +599,7 @@ async def ingest_all_sources(
     limit_per_source: Optional[int] = None,
     timeout: int = 20,
     otx_api_key: Optional[str] = None,
+    org_id=None,
 ) -> Dict[str, Any]:
     feed_results: List[FeedResult] = []
     for source in FEEDS.keys():
@@ -577,6 +609,7 @@ async def ingest_all_sources(
             limit=limit_per_source,
             timeout=timeout,
             otx_api_key=otx_api_key,
+            org_id=org_id,
         )
         feed_results.append(res)
 

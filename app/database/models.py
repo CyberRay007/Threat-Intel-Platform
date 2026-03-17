@@ -1,6 +1,9 @@
 # app/database/models.py
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON, Text, UniqueConstraint, Boolean
-from sqlalchemy.dialects.postgresql import JSONB
+from enum import Enum
+from uuid import uuid4
+
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON, Text, UniqueConstraint, Boolean, Float
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -8,14 +11,34 @@ from datetime import datetime
 Base = declarative_base()
 JSON_TYPE = JSON().with_variant(JSONB, "postgresql")
 
+
+class Role(str, Enum):
+    ADMIN = "admin"
+    ANALYST = "analyst"
+    VIEWER = "viewer"
+    API_CLIENT = "api_client"
+
+
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    users = relationship("User", back_populates="organization")
+
 class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
+    role = Column(String, default=Role.ANALYST.value, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    organization = relationship("Organization", back_populates="users")
     scans = relationship("Scan", back_populates="user")
     events = relationship("Event", back_populates="user")
 
@@ -24,6 +47,7 @@ class Scan(Base):
     __tablename__ = "scans"
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     target_url = Column(String, nullable=False)
     status = Column(String, default="pending")  # pending, running, completed
@@ -77,6 +101,7 @@ class ThreatActor(Base):
     __tablename__ = "threat_actors"
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     name = Column(String, nullable=False, unique=True, index=True)
     description = Column(Text)
     origin = Column(String)  # country / region attribution
@@ -94,6 +119,7 @@ class FileScan(Base):
     __tablename__ = "file_scans"
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     filename = Column(String, nullable=False)
     sha256 = Column(String, nullable=False, index=True)
@@ -112,10 +138,15 @@ class IOC(Base):
     __table_args__ = (UniqueConstraint("type", "value", name="uq_ioc_type_value"),)
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     type = Column(String, nullable=False)
     value = Column(String, nullable=False, index=True)
     threat_actor_id = Column(Integer, ForeignKey("threat_actors.id"), nullable=True)
     source = Column(String)
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+    confidence = Column(Float, default=0.5)
+    source_reliability = Column(Float, default=0.5)
 
     threat_actor = relationship("ThreatActor", back_populates="iocs")
     relationships = relationship("IOCRelationship", back_populates="ioc")
@@ -135,6 +166,7 @@ class Event(Base):
     __tablename__ = "events"
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     source = Column(String, nullable=False, default="api")
     domain = Column(String, nullable=True, index=True)
@@ -157,6 +189,7 @@ class Alert(Base):
     __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     fingerprint = Column(String, unique=True, index=True, nullable=False)
     observable_type = Column(String, nullable=False)
     observable_value = Column(String, nullable=False)
@@ -165,6 +198,7 @@ class Alert(Base):
     description = Column(Text, default="")
     matched_count = Column(Integer, default=0)
     status = Column(String, nullable=False, default="open")
+    assigned_to = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     first_seen_at = Column(DateTime, default=datetime.utcnow)
     last_seen_at = Column(DateTime, default=datetime.utcnow)
     occurrence_count = Column(Integer, default=1)
@@ -177,6 +211,7 @@ class MalwareFamily(Base):
     __tablename__ = "malware_families"
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     name = Column(String, nullable=False, unique=True, index=True)
     family_type = Column(String)  # ransomware, trojan, worm, spyware, etc.
     description = Column(Text)
@@ -190,6 +225,7 @@ class Campaign(Base):
     __tablename__ = "campaigns"
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     name = Column(String, nullable=False, unique=True, index=True)
     description = Column(Text)
     threat_actor_id = Column(Integer, ForeignKey("threat_actors.id"), nullable=True, index=True)
@@ -212,6 +248,7 @@ class IOCRelationship(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     ioc_id = Column(Integer, ForeignKey("ioc.id"), nullable=False, index=True)
     relationship_type = Column(String, nullable=False)  # e.g. associated_with, used_by, part_of
     # Denormalised entity discriminator — mirrors the nullable FK that is set
@@ -245,6 +282,7 @@ class IOCGraphRelationship(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     source_ioc_id = Column(Integer, ForeignKey("ioc.id"), nullable=False, index=True)
     target_ioc_id = Column(Integer, ForeignKey("ioc.id"), nullable=False, index=True)
     relationship_type = Column(String, nullable=False)
@@ -265,3 +303,37 @@ class DetectionRule(Base):
     severity = Column(String, nullable=False, default="low")
     enabled = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class APIKey(Base):
+    __tablename__ = "api_keys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
+    key_hash = Column(String, nullable=False, unique=True, index=True)
+    permissions = Column(JSON_TYPE, default=list)
+    last_used = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class IOCTag(Base):
+    __tablename__ = "ioc_tags"
+    __table_args__ = (UniqueConstraint("ioc_id", "tag", name="uq_ioc_tag"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
+    ioc_id = Column(Integer, ForeignKey("ioc.id"), nullable=False, index=True)
+    tag = Column(String, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AlertHistory(Base):
+    __tablename__ = "alert_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
+    alert_id = Column(Integer, ForeignKey("alerts.id"), nullable=False, index=True)
+    action = Column(String, nullable=False)
+    performed_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    details = Column(JSON_TYPE, default=dict)
+    timestamp = Column(DateTime, default=datetime.utcnow)

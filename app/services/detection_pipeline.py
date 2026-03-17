@@ -80,14 +80,14 @@ def extract_observables(payload: Dict[str, Any]) -> Dict[str, List[str]]:
     }
 
 
-async def _match_type(db: AsyncSession, ioc_type: str, values: List[str]) -> List[Dict[str, Any]]:
+async def _match_type(db: AsyncSession, ioc_type: str, values: List[str], org_id=None) -> List[Dict[str, Any]]:
     if not values:
         return []
 
     matches: List[Dict[str, Any]] = []
     for part in _chunk(values):
         rows = await db.execute(
-            select(IOC).where(IOC.type == ioc_type, IOC.value.in_(part))
+            select(IOC).where(IOC.type == ioc_type, IOC.value.in_(part), IOC.org_id == org_id)
         )
         for ioc in rows.scalars().all():
             matches.append(
@@ -103,12 +103,12 @@ async def _match_type(db: AsyncSession, ioc_type: str, values: List[str]) -> Lis
     return matches
 
 
-async def match_observables(db: AsyncSession, observables: Dict[str, List[str]]) -> Dict[str, List[Dict[str, Any]]]:
+async def match_observables(db: AsyncSession, observables: Dict[str, List[str]], org_id=None) -> Dict[str, List[Dict[str, Any]]]:
     return {
-        "domain": await _match_type(db, "domain", observables.get("domain", [])),
-        "url": await _match_type(db, "url", observables.get("url", [])),
-        "ip": await _match_type(db, "ip", observables.get("ip", [])),
-        "file_hash": await _match_type(db, "file_hash", observables.get("file_hash", [])),
+        "domain": await _match_type(db, "domain", observables.get("domain", []), org_id=org_id),
+        "url": await _match_type(db, "url", observables.get("url", []), org_id=org_id),
+        "ip": await _match_type(db, "ip", observables.get("ip", []), org_id=org_id),
+        "file_hash": await _match_type(db, "file_hash", observables.get("file_hash", []), org_id=org_id),
     }
 
 
@@ -227,7 +227,7 @@ async def process_event(
     event.url = observables.get("url", [None])[0] if observables.get("url") else None
     event.ip = observables.get("ip", [None])[0] if observables.get("ip") else None
     event.file_hash = observables.get("file_hash", [None])[0] if observables.get("file_hash") else None
-    matches = await match_observables(db, observables)
+    matches = await match_observables(db, observables, org_id=event.org_id)
     total_ioc_matches = sum(len(v) for v in matches.values())
     rule_hits = await evaluate_detection_rules(db, observables)
     now = datetime.utcnow()
@@ -257,7 +257,7 @@ async def process_event(
             )
 
             existing = await db.execute(
-                select(Alert).where(Alert.fingerprint == fingerprint)
+                select(Alert).where(Alert.fingerprint == fingerprint, Alert.org_id == event.org_id)
             )
             alert = existing.scalar_one_or_none()
             if alert:
@@ -275,6 +275,7 @@ async def process_event(
                 event.alert_id = alert.id
             else:
                 alert = Alert(
+                    org_id=event.org_id,
                     fingerprint=fingerprint,
                     observable_type=observable_type,
                     observable_value=observable_value,

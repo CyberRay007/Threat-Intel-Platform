@@ -299,3 +299,52 @@ Threat test verification
 
 Week 7 readiness
 Backend Week 6 requirements are validated and committed; frontend Week 7 implementation can start from this checkpoint.
+
+Production Readiness Checkpoint (2026-03-17)
+This checkpoint reflects the current architecture status after validating backend and deployment modules.
+
+Current readiness summary
+Implemented strongly
+• Core detection/intelligence prototype mechanics
+• Versioned API routing (/api/v1)
+• Organization-linked data model with org-scoped queries in critical paths
+• JWT + API key authentication and baseline RBAC permission checks
+• Dockerized local stack (API, worker, Redis, Postgres, nginx)
+
+Partial but promising
+• Feed ingestion operations and async replay reliability foundations
+• Structured JSON logging and request latency logging
+• Analyst-facing UI and investigation flows
+• Feed export endpoints (JSON/CSV)
+
+High-risk gaps for commercial SaaS
+• Full tenant-isolation test coverage and hard guarantees across all code paths
+• Observability stack (metrics, dashboards, alerting)
+• Integration contracts (SIEM/SOAR connectors, STIX/TAXII support)
+• Billing/subscription and usage metering
+• Compliance governance (retention, audit posture, privacy controls)
+
+Priority order to become a production TIP service
+1. Harden multi-tenant isolation end-to-end
+     - Validate org filters on every read/write path
+     - Add cross-tenant negative tests for auth/intel/detection/export APIs
+2. Productize access control and API surface
+     - Standardize and document /api/v1 contracts
+     - Expand API key lifecycle controls (issue/revoke/rotate)
+     - Move rate limiting from in-memory to Redis-backed controls
+3. Implement observability and reliability controls
+     - Introduce metrics for ingest freshness, queue lag, latency, and error rates
+     - Add feed failure and backlog growth alerting
+4. Define integration and export standards
+     - Add first SIEM connector (for example Splunk or Elastic)
+     - Add STIX/TAXII export support
+5. Add SaaS and governance foundations
+     - Plans, quotas, usage metering, and billing hooks
+     - Retention policies, data governance controls, and compliance runbooks
+
+Immediate next sprint recommendation (2 weeks)
+• Tenant isolation test matrix and remediation
+• Redis-backed per-org/per-key rate limiting
+• Feed health persistence (last_success, last_failure, failure_count, freshness)
+• Metrics endpoint and baseline operational dashboard
+• API key lifecycle endpoints with audit events

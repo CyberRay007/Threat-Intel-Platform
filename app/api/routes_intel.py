@@ -1,13 +1,17 @@
+from datetime import datetime
 from typing import Optional
+import csv
+import io
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import OTX_API_KEY
 from app.database.models import IOC, IOCGraphRelationship, IOCRelationship, MalwareFamily, User
 from app.database.session import get_db
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, require_permission
 from app.schemas.intel_schema import (
     IOCCreate,
     IOCResponse,
@@ -29,15 +33,26 @@ async def run_ingestion(
     source: Optional[str] = Query(default=None),
     limit: Optional[int] = Query(default=None, ge=1),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("feed:write")),
 ):
     if source:
         if source not in FEEDS:
             return {"error": f"unknown source '{source}'", "supported_sources": sorted(FEEDS.keys())}
-        result = await ingest_source(db, source=source, limit=limit, otx_api_key=OTX_API_KEY or None)
+        result = await ingest_source(
+            db,
+            source=source,
+            limit=limit,
+            otx_api_key=OTX_API_KEY or None,
+            org_id=current_user.org_id,
+        )
         return {"source": result.__dict__}
 
-    return await ingest_all_sources(db, limit_per_source=limit, otx_api_key=OTX_API_KEY or None)
+    return await ingest_all_sources(
+        db,
+        limit_per_source=limit,
+        otx_api_key=OTX_API_KEY or None,
+        org_id=current_user.org_id,
+    )
 
 
 @router.get("/intel/ioc/enrich")
@@ -45,9 +60,9 @@ async def enrich_ioc_endpoint(
     ioc_type: str = Query(..., description="domain|url|ip|file_hash"),
     value: str = Query(..., min_length=2),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
-    return await enrich_ioc(db, ioc_type=ioc_type, value=value)
+    return await enrich_ioc(db, ioc_type=ioc_type, value=value, org_id=current_user.org_id)
 
 
 @router.get("/intel/attribution")
@@ -55,22 +70,22 @@ async def attribution_endpoint(
     ioc_type: str = Query(..., description="domain|url|ip|file_hash"),
     value: str = Query(..., min_length=2),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
-    return await attribute_observable(db, ioc_type=ioc_type, value=value)
+    return await attribute_observable(db, ioc_type=ioc_type, value=value, org_id=current_user.org_id)
 
 
 @router.get("/intel/ioc/stats")
 async def ioc_stats(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
-    total = await db.execute(select(func.count()).select_from(IOC))
+    total = await db.execute(select(func.count()).select_from(IOC).where(IOC.org_id == current_user.org_id))
     by_type = await db.execute(
-        select(IOC.type, func.count()).group_by(IOC.type).order_by(IOC.type)
+        select(IOC.type, func.count()).where(IOC.org_id == current_user.org_id).group_by(IOC.type).order_by(IOC.type)
     )
     by_source = await db.execute(
-        select(IOC.source, func.count()).group_by(IOC.source).order_by(IOC.source)
+        select(IOC.source, func.count()).where(IOC.org_id == current_user.org_id).group_by(IOC.source).order_by(IOC.source)
     )
 
     by_type_rows = by_type.all()
@@ -97,13 +112,13 @@ async def ioc_stats(
 async def domains_shared_malware_family(
     domain: str = Query(..., min_length=3),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
     """Return domains linked to the same malware family as the input domain."""
     domain_norm = domain.strip().lower().strip(".")
 
     source_ioc_row = await db.execute(
-        select(IOC).where(IOC.type == "domain", IOC.value == domain_norm)
+        select(IOC).where(IOC.type == "domain", IOC.value == domain_norm, IOC.org_id == current_user.org_id)
     )
     source_ioc = source_ioc_row.scalar_one_or_none()
     if not source_ioc:
@@ -114,6 +129,7 @@ async def domains_shared_malware_family(
         .where(
             IOCRelationship.ioc_id == source_ioc.id,
             IOCRelationship.malware_family_id.isnot(None),
+            IOCRelationship.org_id == current_user.org_id,
         )
         .distinct()
     )
@@ -122,7 +138,7 @@ async def domains_shared_malware_family(
         return {"domain": domain_norm, "families": [], "related_domains": []}
 
     family_name_rows = await db.execute(
-        select(MalwareFamily.id, MalwareFamily.name).where(MalwareFamily.id.in_(family_ids))
+        select(MalwareFamily.id, MalwareFamily.name).where(MalwareFamily.id.in_(family_ids), MalwareFamily.org_id == current_user.org_id)
     )
     family_name_map = {fid: name for fid, name in family_name_rows.all()}
 
@@ -132,6 +148,8 @@ async def domains_shared_malware_family(
         .where(
             IOC.type == "domain",
             IOCRelationship.malware_family_id.in_(family_ids),
+            IOC.org_id == current_user.org_id,
+            IOCRelationship.org_id == current_user.org_id,
         )
         .distinct()
     )
@@ -153,11 +171,11 @@ async def list_iocs(
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
     offset = (page - 1) * limit
-    base = select(IOC)
-    count_q = select(func.count()).select_from(IOC)
+    base = select(IOC).where(IOC.org_id == current_user.org_id)
+    count_q = select(func.count()).select_from(IOC).where(IOC.org_id == current_user.org_id)
 
     if query:
         q = f"%{query.strip().lower()}%"
@@ -181,7 +199,7 @@ async def list_iocs(
     rels = []
     if ioc_ids:
         rel_rows = await db.execute(
-            select(IOCRelationship).where(IOCRelationship.ioc_id.in_(ioc_ids))
+            select(IOCRelationship).where(IOCRelationship.ioc_id.in_(ioc_ids), IOCRelationship.org_id == current_user.org_id)
         )
         rels = rel_rows.scalars().all()
 
@@ -190,10 +208,10 @@ async def list_iocs(
     family_map = {}
     campaign_map = {}
     if family_ids:
-        fam_rows = await db.execute(select(MalwareFamily).where(MalwareFamily.id.in_(family_ids)))
+        fam_rows = await db.execute(select(MalwareFamily).where(MalwareFamily.id.in_(family_ids), MalwareFamily.org_id == current_user.org_id))
         family_map = {f.id: f.name for f in fam_rows.scalars().all()}
     if campaign_ids:
-        camp_rows = await db.execute(select(Campaign).where(Campaign.id.in_(campaign_ids)))
+        camp_rows = await db.execute(select(Campaign).where(Campaign.id.in_(campaign_ids), Campaign.org_id == current_user.org_id))
         campaign_map = {c.id: c.name for c in camp_rows.scalars().all()}
 
     rel_by_ioc: dict[int, list[IOCRelationship]] = {}
@@ -214,8 +232,8 @@ async def list_iocs(
                 "confidence": max_conf,
                 "threat_type": ioc.source or "unknown",
                 "malware_family": families[0] if families else None,
-                "first_seen": None,
-                "last_seen": None,
+                "first_seen": ioc.first_seen,
+                "last_seen": ioc.last_seen,
                 "campaigns": campaigns,
                 "feeds": sorted({r.source for r in ioc_rels if r.source} | ({ioc.source} if ioc.source else set())),
                 "relationships": [
@@ -244,11 +262,11 @@ async def list_threat_actors(
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
     offset = (page - 1) * limit
-    base = select(ThreatActor)
-    count_q = select(func.count()).select_from(ThreatActor)
+    base = select(ThreatActor).where(ThreatActor.org_id == current_user.org_id)
+    count_q = select(func.count()).select_from(ThreatActor).where(ThreatActor.org_id == current_user.org_id)
 
     if query:
         q = f"%{query.strip().lower()}%"
@@ -262,10 +280,10 @@ async def list_threat_actors(
     result = []
     for actor in actors:
         ioc_count = await db.execute(
-            select(func.count()).select_from(IOC).where(IOC.threat_actor_id == actor.id)
+            select(func.count()).select_from(IOC).where(IOC.threat_actor_id == actor.id, IOC.org_id == current_user.org_id)
         )
         campaign_count = await db.execute(
-            select(func.count()).select_from(Campaign).where(Campaign.threat_actor_id == actor.id)
+            select(func.count()).select_from(Campaign).where(Campaign.threat_actor_id == actor.id, Campaign.org_id == current_user.org_id)
         )
         result.append(
             {
@@ -297,16 +315,16 @@ async def list_actor_iocs(
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
-    actor_row = await db.execute(select(ThreatActor).where(ThreatActor.id == actor_id))
+    actor_row = await db.execute(select(ThreatActor).where(ThreatActor.id == actor_id, ThreatActor.org_id == current_user.org_id))
     actor = actor_row.scalar_one_or_none()
     if not actor:
         raise HTTPException(status_code=404, detail="actor not found")
 
     offset = (page - 1) * limit
-    base = select(IOC).where(IOC.threat_actor_id == actor_id)
-    count_q = select(func.count()).select_from(IOC).where(IOC.threat_actor_id == actor_id)
+    base = select(IOC).where(IOC.threat_actor_id == actor_id, IOC.org_id == current_user.org_id)
+    count_q = select(func.count()).select_from(IOC).where(IOC.threat_actor_id == actor_id, IOC.org_id == current_user.org_id)
 
     if ioc_type:
         ioc_type_norm = ioc_type.strip().lower()
@@ -350,18 +368,18 @@ async def list_actor_iocs(
 async def get_threat_actor(
     actor_id: int,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
-    actor_row = await db.execute(select(ThreatActor).where(ThreatActor.id == actor_id))
+    actor_row = await db.execute(select(ThreatActor).where(ThreatActor.id == actor_id, ThreatActor.org_id == current_user.org_id))
     actor = actor_row.scalar_one_or_none()
     if not actor:
         return {"error": "actor not found"}
 
-    ioc_rows = await db.execute(select(IOC).where(IOC.threat_actor_id == actor.id).limit(200))
+    ioc_rows = await db.execute(select(IOC).where(IOC.threat_actor_id == actor.id, IOC.org_id == current_user.org_id).limit(200))
     iocs = ioc_rows.scalars().all()
 
     campaign_rows = await db.execute(
-        select(Campaign).where(Campaign.threat_actor_id == actor.id).order_by(Campaign.name.asc())
+        select(Campaign).where(Campaign.threat_actor_id == actor.id, Campaign.org_id == current_user.org_id).order_by(Campaign.name.asc())
     )
     campaigns = campaign_rows.scalars().all()
 
@@ -370,7 +388,7 @@ async def get_threat_actor(
     if ioc_values:
         alert_rows = await db.execute(
             select(Alert)
-            .where(Alert.observable_value.in_(ioc_values))
+            .where(Alert.observable_value.in_(ioc_values), Alert.org_id == current_user.org_id)
             .order_by(Alert.last_seen_at.desc())
             .limit(50)
         )
@@ -424,17 +442,18 @@ async def get_threat_actor(
 @router.get("/intel/dashboard")
 async def intel_dashboard(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
-    total_iocs = await db.execute(select(func.count()).select_from(IOC))
+    total_iocs = await db.execute(select(func.count()).select_from(IOC).where(IOC.org_id == current_user.org_id))
     by_source = await db.execute(
-        select(IOC.source, func.count()).group_by(IOC.source).order_by(func.count().desc())
+        select(IOC.source, func.count()).where(IOC.org_id == current_user.org_id).group_by(IOC.source).order_by(func.count().desc())
     )
-    by_type = await db.execute(select(IOC.type, func.count()).group_by(IOC.type).order_by(IOC.type))
+    by_type = await db.execute(select(IOC.type, func.count()).where(IOC.org_id == current_user.org_id).group_by(IOC.type).order_by(IOC.type))
 
     actor_rows = await db.execute(
         select(ThreatActor.id, ThreatActor.name, func.count(IOC.id))
         .outerjoin(IOC, IOC.threat_actor_id == ThreatActor.id)
+        .where(ThreatActor.org_id == current_user.org_id)
         .group_by(ThreatActor.id, ThreatActor.name)
         .order_by(func.count(IOC.id).desc())
         .limit(10)
@@ -459,19 +478,29 @@ async def intel_dashboard(
 async def create_ioc(
     payload: IOCCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:write")),
 ):
     ioc_type = payload.type.strip().lower()
     if ioc_type == "file_hash":
         ioc_type = "hash"
-    existing = await db.execute(select(IOC).where(IOC.type == ioc_type, IOC.value == payload.value.strip()))
+    existing = await db.execute(select(IOC).where(IOC.type == ioc_type, IOC.value == payload.value.strip(), IOC.org_id == current_user.org_id))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="IOC with this type and value already exists")
     if payload.threat_actor_id:
-        ta = await db.execute(select(ThreatActor).where(ThreatActor.id == payload.threat_actor_id))
+        ta = await db.execute(select(ThreatActor).where(ThreatActor.id == payload.threat_actor_id, ThreatActor.org_id == current_user.org_id))
         if not ta.scalar_one_or_none():
             raise HTTPException(status_code=404, detail="ThreatActor not found")
-    ioc = IOC(type=ioc_type, value=payload.value.strip(), threat_actor_id=payload.threat_actor_id, source=payload.source)
+    ioc = IOC(
+        org_id=current_user.org_id,
+        type=ioc_type,
+        value=payload.value.strip(),
+        threat_actor_id=payload.threat_actor_id,
+        source=payload.source,
+        first_seen=datetime.utcnow(),
+        last_seen=datetime.utcnow(),
+        confidence=0.7,
+        source_reliability=0.7,
+    )
     db.add(ioc)
     await db.commit()
     await db.refresh(ioc)
@@ -482,9 +511,9 @@ async def create_ioc(
 async def get_ioc(
     ioc_id: int,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
-    row = await db.execute(select(IOC).where(IOC.id == ioc_id))
+    row = await db.execute(select(IOC).where(IOC.id == ioc_id, IOC.org_id == current_user.org_id))
     ioc = row.scalar_one_or_none()
     if not ioc:
         raise HTTPException(status_code=404, detail="IOC not found")
@@ -495,9 +524,9 @@ async def get_ioc(
 async def get_ioc_relationships(
     ioc_id: int,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:read")),
 ):
-    source_row = await db.execute(select(IOC).where(IOC.id == ioc_id))
+    source_row = await db.execute(select(IOC).where(IOC.id == ioc_id, IOC.org_id == current_user.org_id))
     source_ioc = source_row.scalar_one_or_none()
     if not source_ioc:
         raise HTTPException(status_code=404, detail="IOC not found")
@@ -505,7 +534,11 @@ async def get_ioc_relationships(
     outgoing = await db.execute(
         select(IOCGraphRelationship, IOC)
         .join(IOC, IOC.id == IOCGraphRelationship.target_ioc_id)
-        .where(IOCGraphRelationship.source_ioc_id == ioc_id)
+        .where(
+            IOCGraphRelationship.source_ioc_id == ioc_id,
+            IOCGraphRelationship.org_id == current_user.org_id,
+            IOC.org_id == current_user.org_id,
+        )
         .order_by(IOCGraphRelationship.id.desc())
         .limit(500)
     )
@@ -513,7 +546,11 @@ async def get_ioc_relationships(
     incoming = await db.execute(
         select(IOCGraphRelationship, IOC)
         .join(IOC, IOC.id == IOCGraphRelationship.source_ioc_id)
-        .where(IOCGraphRelationship.target_ioc_id == ioc_id)
+        .where(
+            IOCGraphRelationship.target_ioc_id == ioc_id,
+            IOCGraphRelationship.org_id == current_user.org_id,
+            IOC.org_id == current_user.org_id,
+        )
         .order_by(IOCGraphRelationship.id.desc())
         .limit(500)
     )
@@ -563,14 +600,14 @@ async def update_ioc(
     ioc_id: int,
     payload: IOCUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:write")),
 ):
-    row = await db.execute(select(IOC).where(IOC.id == ioc_id))
+    row = await db.execute(select(IOC).where(IOC.id == ioc_id, IOC.org_id == current_user.org_id))
     ioc = row.scalar_one_or_none()
     if not ioc:
         raise HTTPException(status_code=404, detail="IOC not found")
     if payload.threat_actor_id is not None:
-        ta = await db.execute(select(ThreatActor).where(ThreatActor.id == payload.threat_actor_id))
+        ta = await db.execute(select(ThreatActor).where(ThreatActor.id == payload.threat_actor_id, ThreatActor.org_id == current_user.org_id))
         if not ta.scalar_one_or_none():
             raise HTTPException(status_code=404, detail="ThreatActor not found")
         ioc.threat_actor_id = payload.threat_actor_id
@@ -585,9 +622,9 @@ async def update_ioc(
 async def delete_ioc(
     ioc_id: int,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:write")),
 ):
-    row = await db.execute(select(IOC).where(IOC.id == ioc_id))
+    row = await db.execute(select(IOC).where(IOC.id == ioc_id, IOC.org_id == current_user.org_id))
     ioc = row.scalar_one_or_none()
     if not ioc:
         raise HTTPException(status_code=404, detail="IOC not found")
@@ -603,12 +640,13 @@ async def delete_ioc(
 async def create_threat_actor(
     payload: ThreatActorCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:write")),
 ):
-    existing = await db.execute(select(ThreatActor).where(ThreatActor.name == payload.name.strip()))
+    existing = await db.execute(select(ThreatActor).where(ThreatActor.name == payload.name.strip(), ThreatActor.org_id == current_user.org_id))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Threat actor with this name already exists")
     actor = ThreatActor(
+        org_id=current_user.org_id,
         name=payload.name.strip(),
         description=payload.description,
         origin=payload.origin,
@@ -627,9 +665,9 @@ async def update_threat_actor(
     actor_id: int,
     payload: ThreatActorUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:write")),
 ):
-    row = await db.execute(select(ThreatActor).where(ThreatActor.id == actor_id))
+    row = await db.execute(select(ThreatActor).where(ThreatActor.id == actor_id, ThreatActor.org_id == current_user.org_id))
     actor = row.scalar_one_or_none()
     if not actor:
         raise HTTPException(status_code=404, detail="Threat actor not found")
@@ -652,11 +690,122 @@ async def update_threat_actor(
 async def delete_threat_actor(
     actor_id: int,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("intel:write")),
 ):
-    row = await db.execute(select(ThreatActor).where(ThreatActor.id == actor_id))
+    row = await db.execute(select(ThreatActor).where(ThreatActor.id == actor_id, ThreatActor.org_id == current_user.org_id))
     actor = row.scalar_one_or_none()
     if not actor:
         raise HTTPException(status_code=404, detail="Threat actor not found")
     await db.delete(actor)
     await db.commit()
+
+
+@router.post("/intel/check")
+async def intel_check(
+    ioc_type: str,
+    value: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("intel:read")),
+):
+    enrichment = await enrich_ioc(db, ioc_type=ioc_type, value=value, org_id=current_user.org_id)
+    attribution = await attribute_observable(db, ioc_type=ioc_type, value=value, org_id=current_user.org_id)
+    confidence = 0.0
+    if enrichment.get("exists"):
+        confidence = max(
+            float(enrichment.get("confidence") or 0),
+            max([float(a.get("confidence", 0)) for a in attribution.get("actors", [])], default=0.0),
+        )
+    risk_score = min(100, int(confidence))
+    return {
+        "ioc_type": ioc_type,
+        "value": value,
+        "risk_score": risk_score,
+        "confidence_score": confidence,
+        "malware_family": enrichment.get("malware_families", [{}])[0].get("name") if enrichment.get("malware_families") else None,
+        "threat_type": enrichment.get("threat_type") or enrichment.get("source"),
+        "tags": [],
+        "campaign": enrichment.get("campaigns", [{}])[0].get("name") if enrichment.get("campaigns") else None,
+        "actor": attribution.get("actors", [{}])[0].get("name") if attribution.get("actors") else None,
+    }
+
+
+@router.get("/intel/campaigns/{campaign_id}")
+async def get_campaign(
+    campaign_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("intel:read")),
+):
+    row = await db.execute(select(Campaign).where(Campaign.id == campaign_id, Campaign.org_id == current_user.org_id))
+    campaign = row.scalar_one_or_none()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    ioc_rows = await db.execute(
+        select(IOC)
+        .join(IOCRelationship, IOCRelationship.ioc_id == IOC.id)
+        .where(IOCRelationship.campaign_id == campaign.id, IOC.org_id == current_user.org_id, IOCRelationship.org_id == current_user.org_id)
+        .limit(500)
+    )
+    return {
+        "id": campaign.id,
+        "name": campaign.name,
+        "description": campaign.description,
+        "first_seen": campaign.first_seen,
+        "last_seen": campaign.last_seen,
+        "iocs": [
+            {"id": i.id, "type": i.type, "value": i.value, "source": i.source}
+            for i in ioc_rows.scalars().all()
+        ],
+    }
+
+
+def _to_csv(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
+
+
+@router.get("/feeds/phishing")
+async def export_phishing_feed(
+    format: str = Query(default="json", pattern="^(json|csv)$"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("feed:read")),
+):
+    rows = await db.execute(
+        select(IOC).where(IOC.org_id == current_user.org_id, IOC.type.in_(["domain", "url"]), IOC.source.in_(["phishtank", "openphish"])).order_by(IOC.id.desc()).limit(10000)
+    )
+    items = [{"id": i.id, "type": i.type, "value": i.value, "source_feed": i.source, "confidence": i.confidence, "last_verified": i.last_seen} for i in rows.scalars().all()]
+    if format == "csv":
+        return Response(content=_to_csv(items), media_type="text/csv")
+    return {"items": items}
+
+
+@router.get("/feeds/malware")
+async def export_malware_feed(
+    format: str = Query(default="json", pattern="^(json|csv)$"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("feed:read")),
+):
+    rows = await db.execute(
+        select(IOC).where(IOC.org_id == current_user.org_id, IOC.type == "file_hash").order_by(IOC.id.desc()).limit(10000)
+    )
+    items = [{"id": i.id, "type": i.type, "value": i.value, "source_feed": i.source, "confidence": i.confidence, "last_verified": i.last_seen} for i in rows.scalars().all()]
+    if format == "csv":
+        return Response(content=_to_csv(items), media_type="text/csv")
+    return {"items": items}
+
+
+@router.get("/feeds/iocs")
+async def export_all_iocs(
+    format: str = Query(default="json", pattern="^(json|csv)$"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("feed:read")),
+):
+    rows = await db.execute(select(IOC).where(IOC.org_id == current_user.org_id).order_by(IOC.id.desc()).limit(20000))
+    items = [{"id": i.id, "type": i.type, "value": i.value, "source_feed": i.source, "confidence": i.confidence, "first_seen": i.first_seen, "last_seen": i.last_seen} for i in rows.scalars().all()]
+    if format == "csv":
+        return Response(content=_to_csv(items), media_type="text/csv")
+    return {"items": items}

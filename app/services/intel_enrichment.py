@@ -36,17 +36,18 @@ def _ioc_db_types(ioc_type: str) -> List[str]:
     return [t]
 
 
-async def _get_ioc(db: AsyncSession, ioc_type: str, value: str) -> Optional[IOC]:
+async def _get_ioc(db: AsyncSession, ioc_type: str, value: str, org_id=None) -> Optional[IOC]:
     value_norm = normalize_ioc_value(ioc_type, value)
     ioc_types = _ioc_db_types(ioc_type)
-    row = await db.execute(
-        select(IOC).where(IOC.type.in_(ioc_types), IOC.value == value_norm)
-    )
+    query = select(IOC).where(IOC.type.in_(ioc_types), IOC.value == value_norm)
+    if org_id is not None:
+        query = query.where(IOC.org_id == org_id)
+    row = await db.execute(query)
     return row.scalar_one_or_none()
 
 
-async def enrich_ioc(db: AsyncSession, ioc_type: str, value: str) -> Dict[str, Any]:
-    ioc = await _get_ioc(db, ioc_type, value)
+async def enrich_ioc(db: AsyncSession, ioc_type: str, value: str, org_id=None) -> Dict[str, Any]:
+    ioc = await _get_ioc(db, ioc_type, value, org_id=org_id)
     if not ioc:
         return {
             "exists": False,
@@ -124,8 +125,8 @@ async def enrich_ioc(db: AsyncSession, ioc_type: str, value: str) -> Dict[str, A
     }
 
 
-async def attribute_observable(db: AsyncSession, ioc_type: str, value: str) -> Dict[str, Any]:
-    ioc = await _get_ioc(db, ioc_type, value)
+async def attribute_observable(db: AsyncSession, ioc_type: str, value: str, org_id=None) -> Dict[str, Any]:
+    ioc = await _get_ioc(db, ioc_type, value, org_id=org_id)
     if not ioc:
         return {
             "attributed": False,

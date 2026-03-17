@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 
@@ -53,3 +53,10 @@ class FileScanResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class FileScanListResponse(BaseModel):
+    page: int
+    limit: int
+    total: int
+    scans: List[FileScanResponse]
