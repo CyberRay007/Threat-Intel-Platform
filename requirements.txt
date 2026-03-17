@@ -14,6 +14,7 @@ alembic
 argon2-cffi
 python-whois
 scipy
-python-magic-bin
+python-magic-bin; platform_system == "Windows"
+python-magic; platform_system != "Windows"
 celery
 redis
