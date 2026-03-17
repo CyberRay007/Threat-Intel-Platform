@@ -88,6 +88,8 @@ Thumbs.db
 # Temporary files
 tmp/
 temp/
+*.tmp
+*.out
 *.bak
 *.swp
 *.swo
