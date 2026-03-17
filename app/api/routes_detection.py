@@ -1,13 +1,14 @@
 from datetime import datetime
 from collections import defaultdict
+import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Alert, Event, IOC, ThreatActor, User
+from app.database.models import Alert, AlertHistory, Event, IOC, ThreatActor, User
 from app.database.session import get_db
-from app.dependencies import get_current_user
+from app.dependencies import require_permission
 from app.schemas.detection_schema import (
     AlertInvestigationResponse,
     AlertListResponse,
@@ -28,9 +29,10 @@ VALID_TRIAGE_STATUS = {"open", "in_progress", "resolved", "false_positive"}
 async def ingest_event(
     request: EventIngestRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("alerts:write")),
 ):
     event = Event(
+        org_id=current_user.org_id,
         user_id=current_user.id,
         source=request.source,
         domain=request.payload.get("domain"),
@@ -46,9 +48,13 @@ async def ingest_event(
     await db.refresh(event)
 
     try:
-        task = celery_app.send_task(
-            "app.tasks.celery_worker.process_detection_event_task",
-            args=[event.id],
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                celery_app.send_task,
+                "app.tasks.celery_worker.process_detection_event_task",
+                args=[event.id],
+            ),
+            timeout=3,
         )
     except Exception as exc:
         event.status = "queue_failed"
@@ -78,14 +84,14 @@ async def list_alerts(
     page: int = 1,
     limit: int = 50,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("alerts:read")),
 ):
     limit = max(1, min(limit, 200))
     page = max(1, page)
     offset = (page - 1) * limit
 
-    base_query = select(Alert)
-    count_query = select(func.count()).select_from(Alert)
+    base_query = select(Alert).where(Alert.org_id == current_user.org_id)
+    count_query = select(func.count()).select_from(Alert).where(Alert.org_id == current_user.org_id)
 
     if status:
         base_query = base_query.where(Alert.status == status)
@@ -122,9 +128,9 @@ async def investigate_alert(
     alert_id: int,
     events_limit: int = 50,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("alerts:read")),
 ):
-    alert_row = await db.execute(select(Alert).where(Alert.id == alert_id))
+    alert_row = await db.execute(select(Alert).where(Alert.id == alert_id, Alert.org_id == current_user.org_id))
     alert = alert_row.scalar_one_or_none()
     if not alert:
         raise HTTPException(status_code=404, detail="alert not found")
@@ -132,7 +138,7 @@ async def investigate_alert(
     events_limit = max(1, min(events_limit, 200))
     events_row = await db.execute(
         select(Event)
-        .where(Event.alert_id == alert_id)
+        .where(Event.alert_id == alert_id, Event.org_id == current_user.org_id)
         .order_by(Event.created_at.desc())
         .limit(events_limit)
     )
@@ -157,6 +163,7 @@ async def investigate_alert(
             continue
         rows = await db.execute(
             select(IOC).where(IOC.type.in_(type_filters[ioc_type]), IOC.value.in_(values))
+            .where(IOC.org_id == current_user.org_id)
         )
         ioc_matches[ioc_type] = [
             {
@@ -177,7 +184,7 @@ async def investigate_alert(
             observed_pairs.append((ioc_type, value))
 
     for ioc_type, value in observed_pairs[:20]:
-        attributed = await attribute_observable(db, ioc_type=ioc_type, value=value)
+        attributed = await attribute_observable(db, ioc_type=ioc_type, value=value, org_id=current_user.org_id)
         for actor in attributed.get("actors", []):
             actor_id = actor["id"]
             actor_conf[actor_id] = max(actor_conf[actor_id], actor.get("confidence", 0))
@@ -236,14 +243,14 @@ async def list_events(
     page: int = 1,
     limit: int = 100,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("alerts:read")),
 ):
     limit = max(1, min(limit, 500))
     page = max(1, page)
     offset = (page - 1) * limit
 
-    base = select(Event)
-    count_q = select(func.count()).select_from(Event)
+    base = select(Event).where(Event.org_id == current_user.org_id)
+    count_q = select(func.count()).select_from(Event).where(Event.org_id == current_user.org_id)
 
     if status:
         base = base.where(Event.status == status)
@@ -288,7 +295,7 @@ async def triage_alert(
     alert_id: int,
     request: AlertTriageRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("alerts:write")),
 ):
     new_status = request.status.strip().lower()
     if new_status not in VALID_TRIAGE_STATUS:
@@ -300,7 +307,7 @@ async def triage_alert(
             },
         )
 
-    row = await db.execute(select(Alert).where(Alert.id == alert_id))
+    row = await db.execute(select(Alert).where(Alert.id == alert_id, Alert.org_id == current_user.org_id))
     alert = row.scalar_one_or_none()
     if not alert:
         raise HTTPException(status_code=404, detail="alert not found")
@@ -314,6 +321,15 @@ async def triage_alert(
         alert.description = f"{(alert.description or '').rstrip()}\n{note_line}".strip()
 
     alert.last_seen_at = datetime.utcnow()
+    db.add(
+        AlertHistory(
+            org_id=current_user.org_id,
+            alert_id=alert.id,
+            action="triage_update",
+            performed_by=current_user.id,
+            details={"status": new_status, "note": request.note or ""},
+        )
+    )
     await db.commit()
 
     return AlertTriageResponse(
@@ -330,7 +346,7 @@ async def triage_queue(
     page: int = 1,
     limit: int = 50,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("alerts:read")),
 ):
     limit = max(1, min(limit, 200))
     page = max(1, page)
@@ -345,12 +361,12 @@ async def triage_queue(
 
     rows = await db.execute(
         select(Alert)
-        .where(Alert.status == status)
+        .where(Alert.status == status, Alert.org_id == current_user.org_id)
         .order_by(sev_rank.desc(), Alert.last_seen_at.desc())
         .limit(limit)
         .offset(offset)
     )
-    total = await db.execute(select(func.count()).select_from(Alert).where(Alert.status == status))
+    total = await db.execute(select(func.count()).select_from(Alert).where(Alert.status == status, Alert.org_id == current_user.org_id))
 
     return AlertListResponse(
         page=page,
@@ -363,11 +379,11 @@ async def triage_queue(
 @router.get("/detection/events/stats")
 async def event_stats(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("alerts:read")),
 ):
-    total = await db.execute(select(func.count()).select_from(Event))
-    alerts_created = await db.execute(select(func.count()).select_from(Alert))
-    open_alerts = await db.execute(select(func.count()).select_from(Alert).where(Alert.status == "open"))
+    total = await db.execute(select(func.count()).select_from(Event).where(Event.org_id == current_user.org_id))
+    alerts_created = await db.execute(select(func.count()).select_from(Alert).where(Alert.org_id == current_user.org_id))
+    open_alerts = await db.execute(select(func.count()).select_from(Alert).where(Alert.status == "open", Alert.org_id == current_user.org_id))
 
     total_events = total.scalar_one()
     alerts_created_count = alerts_created.scalar_one()
@@ -385,11 +401,11 @@ async def event_stats(
 async def replay_event_backlog(
     limit: int = 200,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("alerts:write")),
 ):
     rows = await db.execute(
         select(Event.id)
-        .where(Event.status.in_(["queued", "queue_failed"]))
+        .where(Event.status.in_(["queued", "queue_failed"]), Event.org_id == current_user.org_id)
         .order_by(Event.created_at.asc())
         .limit(limit)
     )
@@ -400,9 +416,13 @@ async def replay_event_backlog(
     errors: list[str] = []
     for event_id in event_ids:
         try:
-            celery_app.send_task(
-                "app.tasks.celery_worker.process_detection_event_task",
-                args=[event_id],
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    celery_app.send_task,
+                    "app.tasks.celery_worker.process_detection_event_task",
+                    args=[event_id],
+                ),
+                timeout=3,
             )
             enqueued += 1
         except Exception as exc:

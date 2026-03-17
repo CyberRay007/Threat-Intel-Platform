@@ -65,7 +65,7 @@ async def process_scan(scan_id: int):
                 .values(status="failed", completed_at=datetime.utcnow())
             )
             await db.commit()
-            raise
+            return
 
 
 async def process_file_scan(file_scan_id: int, file_content: bytes, filename: str):
@@ -95,4 +95,4 @@ async def process_file_scan(file_scan_id: int, file_content: bytes, filename: st
                 .values(status="failed", completed_at=datetime.utcnow())
             )
             await db.commit()
-            raise
+            return
