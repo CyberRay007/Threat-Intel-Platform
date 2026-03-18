@@ -24,6 +24,7 @@ class Organization(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     name = Column(String, nullable=False)
+    plan = Column(String, nullable=False, default="free")  # free | pro | enterprise
     created_at = Column(DateTime, default=datetime.utcnow)
 
     users = relationship("User", back_populates="organization")
@@ -337,3 +338,47 @@ class AlertHistory(Base):
     performed_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     details = Column(JSON_TYPE, default=dict)
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
+class FeedHealth(Base):
+    """Tracks per-source feed reliability and freshness."""
+    __tablename__ = "feed_health"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source = Column(String, nullable=False, unique=True, index=True)
+    last_success_at = Column(DateTime, nullable=True)
+    last_failure_at = Column(DateTime, nullable=True)
+    last_failure_message = Column(Text, nullable=True)
+    error_count = Column(Integer, nullable=False, default=0)
+    success_count = Column(Integer, nullable=False, default=0)
+    freshness_score = Column(Float, nullable=False, default=1.0)  # 0.0 (stale) → 1.0 (fresh)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AuditEvent(Base):
+    """Durable audit trail for sensitive control-plane actions."""
+    __tablename__ = "audit_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    action = Column(String, nullable=False, index=True)
+    resource_type = Column(String, nullable=False, index=True)
+    resource_id = Column(String, nullable=True)
+    request_id = Column(String, nullable=True, index=True)
+    details = Column(JSON_TYPE, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SecurityEvent(Base):
+    """Durable security signals (anomalies, auth failures, abuse events)."""
+    __tablename__ = "security_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
+    api_key_id = Column(Integer, ForeignKey("api_keys.id"), nullable=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    signal = Column(String, nullable=False, index=True)
+    request_id = Column(String, nullable=True, index=True)
+    event_metadata = Column("metadata", JSON_TYPE, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)

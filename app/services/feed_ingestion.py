@@ -5,6 +5,7 @@ import csv
 import gzip
 import json
 import re
+import asyncio
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -15,7 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.database.models import IOC, IOCRelationship, IOCGraphRelationship, ThreatActor, MalwareFamily, Campaign, Organization
+from app.database.models import IOC, IOCRelationship, IOCGraphRelationship, ThreatActor, MalwareFamily, Campaign, Organization, FeedHealth
 
 
 SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
@@ -308,6 +309,21 @@ def _row_chunks(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[st
         yield items[i : i + size]
 
 
+async def _enqueue_ioc_index_batches(org_id, identities: List[Tuple[str, str]]) -> None:
+    if not identities:
+        return
+    unique = sorted({(canonicalize_ioc_type(ioc_type), value) for ioc_type, value in identities})
+    from app.tasks.celery_worker import celery_app
+
+    for batch in _chunks(unique, 250):
+        payload = [[ioc_type, value] for ioc_type, value in batch]
+        await asyncio.to_thread(
+            celery_app.send_task,
+            "app.tasks.celery_worker.bulk_index_iocs_task",
+            args=[str(org_id), payload, None],
+        )
+
+
 async def _get_or_create_default_org_id(db: AsyncSession):
     row = await db.execute(select(Organization).order_by(Organization.created_at.asc()).limit(1))
     org = row.scalar_one_or_none()
@@ -345,6 +361,46 @@ async def _insert_missing_iocs(db: AsyncSession, source: str, indicators: List[T
     await db.commit()
 
     return inserted
+
+
+def _compute_freshness(last_success_at: Optional[datetime]) -> float:
+    """Return freshness score in [0.0, 1.0] based on age since last success."""
+    if not last_success_at:
+        return 0.0
+    age_seconds = max(0.0, (datetime.utcnow() - last_success_at).total_seconds())
+    # Fresh for first hour; decays linearly to zero by 24 hours.
+    if age_seconds <= 3600:
+        return 1.0
+    if age_seconds >= 86400:
+        return 0.0
+    return round(1.0 - ((age_seconds - 3600) / (86400 - 3600)), 4)
+
+
+async def _update_feed_health(
+    db: AsyncSession,
+    source: str,
+    *,
+    success: bool,
+    error_message: Optional[str] = None,
+) -> None:
+    row = await db.execute(select(FeedHealth).where(FeedHealth.source == source))
+    health = row.scalar_one_or_none()
+    if health is None:
+        health = FeedHealth(source=source)
+        db.add(health)
+        await db.flush()
+
+    now = datetime.utcnow()
+    if success:
+        health.last_success_at = now
+        health.success_count = int((health.success_count or 0) + 1)
+    else:
+        health.last_failure_at = now
+        health.error_count = int((health.error_count or 0) + 1)
+        health.last_failure_message = (error_message or "")[:1000]
+
+    health.freshness_score = _compute_freshness(health.last_success_at)
+    health.updated_at = now
 
 
 async def _upsert_named_entity(db: AsyncSession, entity_type: str, name: str, org_id) -> int:
@@ -540,12 +596,14 @@ async def ingest_source(
     org_id=None,
 ) -> FeedResult:
     if org_id is None:
-        org_id = await _get_or_create_default_org_id(db)
+        raise ValueError("org_id is required for ingestion")
 
     result = FeedResult(source=source)
     try:
         if FEEDS[source].get("requires_api_key") == "true" and not otx_api_key:
             result.error_message = "skipped_missing_otx_api_key"
+            await _update_feed_health(db, source, success=False, error_message=result.error_message)
+            await db.commit()
             return result
 
         raw_items = fetch_feed(source=source, timeout=max(timeout, 45), otx_api_key=otx_api_key)
@@ -585,12 +643,17 @@ async def ingest_source(
         except Exception as rel_exc:
             # Keep IOC ingestion successful even if relationship enrichment fails.
             result.error_message = f"relationship_enrichment_failed: {rel_exc}"
+        await _update_feed_health(db, source, success=True)
         await db.commit()
+        await _enqueue_ioc_index_batches(org_id=org_id, identities=normalized)
         return result
     except Exception as exc:
         await db.rollback()
         result.errors = 1
         result.error_message = str(exc)
+        # Retry inside same session to persist failure metadata.
+        await _update_feed_health(db, source, success=False, error_message=result.error_message)
+        await db.commit()
         return result
 
 

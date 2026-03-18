@@ -1,0 +1,87 @@
+name: Backend Search CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [feature/**, hotfix/**]
+
+jobs:
+  search-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: threat_user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: threat_intel_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U threat_user -d threat_intel_db"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      opensearch:
+        image: opensearchproject/opensearch:2.19.1
+        env:
+          discovery.type: single-node
+          bootstrap.memory_lock: true
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+          DISABLE_INSTALL_DEMO_CONFIG: true
+          DISABLE_SECURITY_PLUGIN: true
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd="curl -f http://localhost:9200/_cluster/health || exit 1"
+          --health-interval=15s
+          --health-timeout=10s
+          --health-retries=30
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://threat_user:password@localhost:5432/threat_intel_db
+      CELERY_BROKER_URL: redis://localhost:6379/0
+      CELERY_RESULT_BACKEND: redis://localhost:6379/0
+      OPENSEARCH_URL: http://localhost:9200
+      OPENSEARCH_VERIFY_SSL: "false"
+      JWT_SECRET_KEY: ci-test-secret
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Wait for services
+        run: |
+          for i in {1..40}; do
+            curl -fsS http://localhost:9200/_cluster/health && break
+            sleep 3
+          done
+
+      - name: Run search and trace integration tests
+        run: |
+          pytest tests/integration/test_ioc_search_trace.py tests/integration/test_export_entitlements.py -v
+
+      - name: Validate docker compose config
+        run: |
+          docker compose -f docker/docker-compose.yml config

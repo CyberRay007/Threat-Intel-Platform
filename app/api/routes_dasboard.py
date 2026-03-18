@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import Alert, Campaign, Event, IOC, IOCRelationship, MalwareFamily, ThreatActor, User
 from app.database.session import get_db
 from app.dependencies import require_permission
+from app.core.metrics import get_feed_metrics, get_queue_lag_snapshot
+from app.utils.response import ok
 
 
 router = APIRouter()
@@ -173,3 +175,19 @@ async def security_overview(
 			for source, count in feed_rows.all()
 		],
 	}
+
+
+@router.get("/dashboard/metrics")
+async def pipeline_metrics(
+	current_user: User = Depends(require_permission("admin:all")),
+):
+	"""
+	Live pipeline health snapshot.
+
+	Returns feed ingestion success/failure rates and detection queue lag.
+	Every field that breaches a hard threshold is flagged in the response.
+	"""
+	return ok({
+		"feed_metrics": get_feed_metrics(str(current_user.org_id)),
+		"queue_lag": get_queue_lag_snapshot(str(current_user.org_id)),
+	})

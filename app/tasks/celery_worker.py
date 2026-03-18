@@ -38,6 +38,11 @@ celery_app.conf.update(
 			"schedule": 300.0,
 			"args": (200,),
 		},
+		# Check every feed for staleness every 15 minutes.
+		"check-feed-staleness-15m": {
+			"task": "app.tasks.celery_worker.check_feed_staleness_task",
+			"schedule": 900.0,
+		},
 	},
 )
 
@@ -57,10 +62,10 @@ def ingest_single_feed_task(source: str, limit=None):
 
 
 @celery_app.task(name="app.tasks.celery_worker.process_detection_event_task")
-def process_detection_event_task(event_id: int):
+def process_detection_event_task(event_id: int, org_id: str | None = None, request_id: str | None = None):
 	from app.tasks.detection_tasks import process_event_task
 
-	return process_event_task(event_id=event_id)
+	return process_event_task(event_id=event_id, org_id=org_id, request_id=request_id)
 
 
 @celery_app.task(name="app.tasks.celery_worker.process_detection_backlog_task")
@@ -68,3 +73,52 @@ def process_detection_backlog_task(limit: int = 100):
 	from app.tasks.detection_tasks import process_detection_backlog_task as run_backlog
 
 	return run_backlog(limit=limit)
+
+
+@celery_app.task(
+	name="app.tasks.celery_worker.index_ioc_task",
+	bind=True,
+	autoretry_for=(Exception,),
+	retry_backoff=True,
+	retry_jitter=True,
+	retry_kwargs={"max_retries": 5},
+)
+def index_ioc_task(self, ioc_id: int, org_id: str, request_id: str | None = None):
+	from app.tasks.search_tasks import run_index_ioc_task
+
+	return run_index_ioc_task(ioc_id=ioc_id, org_id=org_id, request_id=request_id)
+
+
+@celery_app.task(
+	name="app.tasks.celery_worker.bulk_index_iocs_task",
+	bind=True,
+	autoretry_for=(Exception,),
+	retry_backoff=True,
+	retry_jitter=True,
+	retry_kwargs={"max_retries": 5},
+)
+def bulk_index_iocs_task(self, org_id: str, identities: list[list[str]], request_id: str | None = None):
+	from app.tasks.search_tasks import run_bulk_index_iocs_task
+
+	return run_bulk_index_iocs_task(org_id=org_id, identities=identities, request_id=request_id)
+
+
+@celery_app.task(
+	name="app.tasks.celery_worker.delete_ioc_document_task",
+	bind=True,
+	autoretry_for=(Exception,),
+	retry_backoff=True,
+	retry_jitter=True,
+	retry_kwargs={"max_retries": 5},
+)
+def delete_ioc_document_task(self, ioc_id: int, org_id: str, request_id: str | None = None):
+	from app.tasks.search_tasks import run_delete_ioc_document_task
+
+	return run_delete_ioc_document_task(ioc_id=ioc_id, org_id=org_id, request_id=request_id)
+
+
+@celery_app.task(name="app.tasks.celery_worker.check_feed_staleness_task")
+def check_feed_staleness_task():
+	from app.tasks.intel_tasks import check_feed_staleness_all
+
+	check_feed_staleness_all()
