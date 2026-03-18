@@ -1,4 +1,5 @@
 import uuid
+import json
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +16,7 @@ from app.api import routes_auth, routes_scan, routes_intel, routes_detection, ro
 app = FastAPI(title="Threat Intel Platform")
 
 
-def _error_envelope(code: str, message: str, status_code: int) -> JSONResponse:
+def _error_envelope(code: str, message: str, status_code: int, request_id: str | None = None) -> JSONResponse:
 	body = {
 		"data": None,
 		"error": {
@@ -23,7 +24,7 @@ def _error_envelope(code: str, message: str, status_code: int) -> JSONResponse:
 			"message": message,
 		},
 		"meta": {
-			"request_id": str(uuid.uuid4()),
+			"request_id": request_id or str(uuid.uuid4()),
 		},
 	}
 	return JSONResponse(status_code=status_code, content=body)
@@ -31,19 +32,22 @@ def _error_envelope(code: str, message: str, status_code: int) -> JSONResponse:
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
+	request_id = getattr(request.state, "request_id", None)
 	if isinstance(exc.detail, dict) and "code" in exc.detail and "message" in exc.detail:
-		return _error_envelope(exc.detail["code"], exc.detail["message"], exc.status_code)
-	return _error_envelope("HTTP_ERROR", str(exc.detail), exc.status_code)
+		return _error_envelope(exc.detail["code"], exc.detail["message"], exc.status_code, request_id=request_id)
+	return _error_envelope("HTTP_ERROR", str(exc.detail), exc.status_code, request_id=request_id)
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-	return _error_envelope("VALIDATION_ERROR", "Request validation failed", 422)
+	request_id = getattr(request.state, "request_id", None)
+	return _error_envelope("VALIDATION_ERROR", "Request validation failed", 422, request_id=request_id)
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
 	async def dispatch(self, request, call_next):
 		started = time.time()
+		request.state.request_id = str(uuid.uuid4())
 		request.state.org_id = None
 		auth_header = request.headers.get("authorization", "")
 		if auth_header.lower().startswith("bearer "):
@@ -53,14 +57,61 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 				request.state.org_id = payload.get("org_id")
 			except Exception:
 				if request.url.path.startswith("/api") or request.url.path.startswith("/scans"):
-					return _error_envelope("AUTH_TOKEN_INVALID", "Authentication token is invalid or expired.", 401)
+					return _error_envelope(
+						"AUTH_TOKEN_INVALID",
+						"Authentication token is invalid or expired.",
+						401,
+						request_id=request.state.request_id,
+					)
 
 		response = await call_next(request)
+
+		# Enforce a consistent success envelope for JSON API responses.
+		if (
+			response.status_code < 400
+			and response.media_type == "application/json"
+			and request.url.path not in {"/openapi.json", "/docs", "/redoc"}
+		):
+			chunks = []
+			async for chunk in response.body_iterator:
+				chunks.append(chunk)
+			raw = b"".join(chunks)
+			try:
+				payload = json.loads(raw.decode("utf-8")) if raw else None
+			except Exception:
+				payload = None
+
+			already_enveloped = isinstance(payload, dict) and {"data", "error", "meta"}.issubset(payload.keys())
+			headers = dict(response.headers)
+			headers.pop("content-length", None)
+			headers["X-Request-ID"] = request.state.request_id
+			if already_enveloped:
+				meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+				meta["request_id"] = request.state.request_id
+				payload["meta"] = meta
+				response = JSONResponse(
+					status_code=response.status_code,
+					content=payload,
+					headers=headers,
+				)
+			else:
+				response = JSONResponse(
+					status_code=response.status_code,
+					content={
+						"data": payload,
+						"error": None,
+						"meta": {"request_id": request.state.request_id},
+					},
+					headers=headers,
+				)
+		else:
+			response.headers["X-Request-ID"] = request.state.request_id
 		latency_ms = round((time.time() - started) * 1000, 2)
 		logger.info(
 			"http_request",
 			extra={
 				"extra_payload": {
+					"request_id": request.state.request_id,
 					"path": request.url.path,
 					"method": request.method,
 					"status_code": response.status_code,

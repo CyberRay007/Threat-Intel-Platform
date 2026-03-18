@@ -62,10 +62,10 @@ def ingest_single_feed_task(source: str, limit=None):
 
 
 @celery_app.task(name="app.tasks.celery_worker.process_detection_event_task")
-def process_detection_event_task(event_id: int):
+def process_detection_event_task(event_id: int, org_id: str | None = None, request_id: str | None = None):
 	from app.tasks.detection_tasks import process_event_task
 
-	return process_event_task(event_id=event_id)
+	return process_event_task(event_id=event_id, org_id=org_id, request_id=request_id)
 
 
 @celery_app.task(name="app.tasks.celery_worker.process_detection_backlog_task")

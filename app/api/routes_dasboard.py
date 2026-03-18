@@ -188,6 +188,6 @@ async def pipeline_metrics(
 	Every field that breaches a hard threshold is flagged in the response.
 	"""
 	return ok({
-		"feed_metrics": get_feed_metrics(),
-		"queue_lag": get_queue_lag_snapshot(),
+		"feed_metrics": get_feed_metrics(str(current_user.org_id)),
+		"queue_lag": get_queue_lag_snapshot(str(current_user.org_id)),
 	})

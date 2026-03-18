@@ -580,7 +580,7 @@ async def ingest_source(
     org_id=None,
 ) -> FeedResult:
     if org_id is None:
-        org_id = await _get_or_create_default_org_id(db)
+        raise ValueError("org_id is required for ingestion")
 
     result = FeedResult(source=source)
     try:

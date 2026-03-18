@@ -3,15 +3,18 @@ from typing import Optional
 import csv
 import io
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import OTX_API_KEY
-from app.database.models import IOC, IOCGraphRelationship, IOCRelationship, MalwareFamily, User
+from app.database.models import IOC, IOCGraphRelationship, IOCRelationship, MalwareFamily, User, Organization
 from app.database.session import get_db
 from app.dependencies import get_current_user, require_permission
+from app.core.entitlements import allowed_feed_sources, require_entitlement, require_feature
+from app.core.audit import write_audit_event
+from app.utils.errors import E, api_error
 from app.schemas.intel_schema import (
     IOCCreate,
     IOCResponse,
@@ -30,14 +33,23 @@ router = APIRouter()
 
 @router.post("/intel/ingest")
 async def run_ingestion(
+    request: Request,
     source: Optional[str] = Query(default=None),
     limit: Optional[int] = Query(default=None, ge=1),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("feed:write")),
+    _: User = Depends(require_entitlement("feed_ingest")),
 ):
+    org_row = await db.execute(select(Organization).where(Organization.id == current_user.org_id))
+    org = org_row.scalar_one_or_none()
+    plan_name = org.plan if org else "free"
+    allowed_sources = allowed_feed_sources(plan_name, list(FEEDS.keys()))
+
     if source:
         if source not in FEEDS:
-            return {"error": f"unknown source '{source}'", "supported_sources": sorted(FEEDS.keys())}
+            raise api_error(E.FEED_SOURCE_UNKNOWN, detail_override=f"Unknown source '{source}'")
+        if source not in allowed_sources:
+            raise api_error(E.PLAN_FEATURE_DISABLED, detail_override=f"Feed source '{source}' is not allowed on plan '{plan_name}'")
         result = await ingest_source(
             db,
             source=source,
@@ -45,14 +57,50 @@ async def run_ingestion(
             otx_api_key=OTX_API_KEY or None,
             org_id=current_user.org_id,
         )
+        await write_audit_event(
+            db,
+            action="feed_ingest_triggered",
+            resource_type="feed",
+            resource_id=source,
+            org_id=current_user.org_id,
+            user_id=current_user.id,
+            request_id=getattr(request.state, "request_id", None),
+            details={"limit": limit},
+        )
+        await db.commit()
         return {"source": result.__dict__}
 
-    return await ingest_all_sources(
+    results = []
+    for feed_source in allowed_sources:
+        res = await ingest_source(
+            db,
+            source=feed_source,
+            limit=limit,
+            otx_api_key=OTX_API_KEY or None,
+            org_id=current_user.org_id,
+        )
+        results.append(res)
+    await write_audit_event(
         db,
-        limit_per_source=limit,
-        otx_api_key=OTX_API_KEY or None,
+        action="feed_ingest_all_triggered",
+        resource_type="feed",
+        resource_id="all",
         org_id=current_user.org_id,
+        user_id=current_user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"allowed_sources": allowed_sources, "limit": limit},
     )
+    await db.commit()
+    return {
+        "sources": [r.__dict__ for r in results],
+        "totals": {
+            "fetched": sum(r.fetched for r in results),
+            "normalized": sum(r.normalized for r in results),
+            "inserted": sum(r.inserted for r in results),
+            "skipped": sum(r.skipped for r in results),
+            "errors": sum(r.errors for r in results),
+        },
+    }
 
 
 @router.get("/intel/ioc/enrich")
@@ -773,7 +821,15 @@ async def export_phishing_feed(
     format: str = Query(default="json", pattern="^(json|csv)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("feed:read")),
+    _: User = Depends(require_entitlement("feed_export")),
 ):
+    org_row = await db.execute(select(Organization).where(Organization.id == current_user.org_id))
+    org = org_row.scalar_one_or_none()
+    plan_name = org.plan if org else "free"
+    if format == "csv":
+        require_feature(plan_name, "ioc_export_csv")
+    else:
+        require_feature(plan_name, "ioc_export_json")
     rows = await db.execute(
         select(IOC).where(IOC.org_id == current_user.org_id, IOC.type.in_(["domain", "url"]), IOC.source.in_(["phishtank", "openphish"])).order_by(IOC.id.desc()).limit(10000)
     )
@@ -788,7 +844,15 @@ async def export_malware_feed(
     format: str = Query(default="json", pattern="^(json|csv)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("feed:read")),
+    _: User = Depends(require_entitlement("feed_export")),
 ):
+    org_row = await db.execute(select(Organization).where(Organization.id == current_user.org_id))
+    org = org_row.scalar_one_or_none()
+    plan_name = org.plan if org else "free"
+    if format == "csv":
+        require_feature(plan_name, "ioc_export_csv")
+    else:
+        require_feature(plan_name, "ioc_export_json")
     rows = await db.execute(
         select(IOC).where(IOC.org_id == current_user.org_id, IOC.type == "file_hash").order_by(IOC.id.desc()).limit(10000)
     )
@@ -803,7 +867,15 @@ async def export_all_iocs(
     format: str = Query(default="json", pattern="^(json|csv)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("feed:read")),
+    _: User = Depends(require_entitlement("feed_export")),
 ):
+    org_row = await db.execute(select(Organization).where(Organization.id == current_user.org_id))
+    org = org_row.scalar_one_or_none()
+    plan_name = org.plan if org else "free"
+    if format == "csv":
+        require_feature(plan_name, "ioc_export_csv")
+    else:
+        require_feature(plan_name, "ioc_export_json")
     rows = await db.execute(select(IOC).where(IOC.org_id == current_user.org_id).order_by(IOC.id.desc()).limit(20000))
     items = [{"id": i.id, "type": i.type, "value": i.value, "source_feed": i.source, "confidence": i.confidence, "first_seen": i.first_seen, "last_seen": i.last_seen} for i in rows.scalars().all()]
     if format == "csv":

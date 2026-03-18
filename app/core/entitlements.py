@@ -22,10 +22,14 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import HTTPException
+from fastapi import Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.utils.errors import E, api_error
+from app.database.session import get_db
+from app.database.models import Organization, User
+from app.dependencies import get_current_user
 
 # ---------------------------------------------------------------------------
 # Plan definitions
@@ -39,6 +43,8 @@ PLANS: dict[str, dict[str, Any]] = {
         "features": {
             "ioc_export_csv":  True,
             "ioc_export_json": True,
+            "feed_ingest":     True,
+            "feed_export":     True,
             "stix_export":     False,
             "custom_rules":    False,
             "siem_push":       False,
@@ -52,6 +58,8 @@ PLANS: dict[str, dict[str, Any]] = {
         "features": {
             "ioc_export_csv":  True,
             "ioc_export_json": True,
+            "feed_ingest":     True,
+            "feed_export":     True,
             "stix_export":     True,
             "custom_rules":    True,
             "siem_push":       True,
@@ -65,6 +73,8 @@ PLANS: dict[str, dict[str, Any]] = {
         "features": {
             "ioc_export_csv":  True,
             "ioc_export_json": True,
+            "feed_ingest":     True,
+            "feed_export":     True,
             "stix_export":     True,
             "custom_rules":    True,
             "siem_push":       True,
@@ -77,6 +87,20 @@ PLANS: dict[str, dict[str, Any]] = {
 def get_plan(plan_name: str | None) -> dict:
     """Return plan definition, defaulting to 'free' for unknown plans."""
     return PLANS.get((plan_name or "free").lower(), PLANS["free"])
+
+
+def allowed_feed_sources(plan_name: str | None, all_sources: list[str]) -> list[str]:
+    """
+    Return the subset of feed sources allowed for a plan.
+
+    For capped plans, this currently allows the first N sources in sorted order.
+    Deterministic ordering keeps behaviour stable for API consumers.
+    """
+    plan = get_plan(plan_name)
+    max_feeds = plan.get("max_feeds", -1)
+    if max_feeds == -1:
+        return sorted(all_sources)
+    return sorted(all_sources)[: max(0, int(max_feeds))]
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +118,24 @@ def require_feature(plan_name: str | None, feature: str) -> None:
             E.PLAN_FEATURE_DISABLED,
             detail_override=f"Feature '{feature}' is not available on the '{plan_name or 'free'}' plan.",
         )
+
+
+def require_entitlement(feature: str):
+    """
+    FastAPI dependency factory that hard-blocks requests when an org plan
+    does not include a feature.
+    """
+    async def checker(
+        db: AsyncSession = Depends(get_db),
+        current_user: User = Depends(get_current_user),
+    ) -> User:
+        org_row = await db.execute(select(Organization).where(Organization.id == current_user.org_id))
+        org = org_row.scalar_one_or_none()
+        plan_name = org.plan if org else "free"
+        require_feature(plan_name, feature)
+        return current_user
+
+    return checker
 
 
 # ---------------------------------------------------------------------------

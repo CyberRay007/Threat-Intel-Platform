@@ -2,7 +2,7 @@ import re
 import hashlib
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -16,6 +16,7 @@ from app.core.logging import logger
 from app.dependencies import get_current_user, require_permission
 from app.core.entitlements import check_quota
 from app.utils.errors import E, api_error
+from app.core.audit import write_audit_event
 from app.schemas.auth_schema import APIKeyCreateRequest, APIKeyCreateResponse, APIKeyListItem, Token, UserCreate, UserResponse
 
 router = APIRouter()
@@ -38,7 +39,7 @@ def _validate_password_strength(password: str) -> None:
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
+async def register(user_in: UserCreate, request: Request, db: AsyncSession = Depends(get_db)):
     _validate_password_strength(user_in.password)
 
     # Check if user exists
@@ -60,6 +61,17 @@ async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
     db.add(user)
     await db.commit()
     await db.refresh(user)
+    await write_audit_event(
+        db,
+        action="user_registered",
+        resource_type="user",
+        resource_id=str(user.id),
+        org_id=user.org_id,
+        user_id=user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"email": user.email},
+    )
+    await db.commit()
     logger.info(
         "user_registered",
         extra={"extra_payload": {"event": "user_registered", "user_id": user.id, "org_id": str(user.org_id)}},
@@ -68,7 +80,7 @@ async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).filter_by(email=form_data.username))
     user = result.scalar_one_or_none()
     if not user or not verify_password(form_data.password, user.password_hash):
@@ -86,12 +98,24 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
         "user_login_success",
         extra={"extra_payload": {"event": "user_login_success", "user_id": user.id, "org_id": str(user.org_id)}},
     )
+    await write_audit_event(
+        db,
+        action="user_login",
+        resource_type="auth",
+        resource_id=str(user.id),
+        org_id=user.org_id,
+        user_id=user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"email": user.email},
+    )
+    await db.commit()
     return {"access_token": access_token, "token_type": "bearer"}
 
 
 @router.post("/api-keys", response_model=APIKeyCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_api_key(
     payload: APIKeyCreateRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("admin:all")),
 ):
@@ -109,6 +133,17 @@ async def create_api_key(
     db.add(record)
     await db.commit()
     await db.refresh(record)
+    await write_audit_event(
+        db,
+        action="api_key_created",
+        resource_type="api_key",
+        resource_id=str(record.id),
+        org_id=record.org_id,
+        user_id=current_user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"permissions": payload.permissions},
+    )
+    await db.commit()
     logger.info(
         "api_key_created",
         extra={"extra_payload": {"event": "api_key_created", "api_key_id": record.id, "org_id": str(record.org_id), "created_by": current_user.id}},
@@ -142,6 +177,7 @@ async def list_api_keys(
 @router.delete("/api-keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_api_key(
     key_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("admin:all")),
 ):
@@ -153,6 +189,16 @@ async def revoke_api_key(
         "api_key_revoked",
         extra={"extra_payload": {"event": "api_key_revoked", "api_key_id": item.id, "org_id": str(item.org_id), "revoked_by": current_user.id}},
     )
+    await write_audit_event(
+        db,
+        action="api_key_revoked",
+        resource_type="api_key",
+        resource_id=str(item.id),
+        org_id=item.org_id,
+        user_id=current_user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={},
+    )
     await db.delete(item)
     await db.commit()
 
@@ -160,6 +206,7 @@ async def revoke_api_key(
 @router.post("/api-keys/{key_id}/rotate", response_model=APIKeyCreateResponse)
 async def rotate_api_key(
     key_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("admin:all")),
 ):
@@ -177,6 +224,17 @@ async def rotate_api_key(
         "api_key_rotated",
         extra={"extra_payload": {"event": "api_key_rotated", "api_key_id": item.id, "org_id": str(item.org_id), "rotated_by": current_user.id}},
     )
+    await write_audit_event(
+        db,
+        action="api_key_rotated",
+        resource_type="api_key",
+        resource_id=str(item.id),
+        org_id=item.org_id,
+        user_id=current_user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={},
+    )
+    await db.commit()
 
     return APIKeyCreateResponse(
         id=item.id,

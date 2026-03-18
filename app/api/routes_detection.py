@@ -2,7 +2,7 @@ from datetime import datetime
 from collections import defaultdict
 import asyncio
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +10,8 @@ from app.database.models import Alert, AlertHistory, Event, IOC, ThreatActor, Us
 from app.database.session import get_db
 from app.dependencies import require_permission
 from app.schemas.detection_schema import (
+    AlertAssignRequest,
+    AlertAssignResponse,
     AlertInvestigationResponse,
     AlertListResponse,
     AlertTriageRequest,
@@ -19,6 +21,7 @@ from app.schemas.detection_schema import (
 )
 from app.services.intel_enrichment import attribute_observable
 from app.tasks.celery_worker import celery_app
+from app.core.audit import write_audit_event
 
 
 router = APIRouter()
@@ -28,6 +31,7 @@ VALID_TRIAGE_STATUS = {"open", "in_progress", "resolved", "false_positive"}
 @router.post("/detection/events", response_model=EventEnqueueResponse)
 async def ingest_event(
     request: EventIngestRequest,
+    raw_request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("alerts:write")),
 ):
@@ -52,7 +56,7 @@ async def ingest_event(
             asyncio.to_thread(
                 celery_app.send_task,
                 "app.tasks.celery_worker.process_detection_event_task",
-                args=[event.id],
+                args=[event.id, str(current_user.org_id), getattr(raw_request.state, "request_id", None)],
             ),
             timeout=3,
         )
@@ -71,6 +75,57 @@ async def ingest_event(
     return EventEnqueueResponse(
         event_id=event.id,
         status="queued",
+    )
+
+
+@router.post("/detection/alerts/{alert_id}/assign", response_model=AlertAssignResponse)
+async def assign_alert(
+    alert_id: int,
+    payload: AlertAssignRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("alerts:write")),
+):
+    row = await db.execute(select(Alert).where(Alert.id == alert_id, Alert.org_id == current_user.org_id))
+    alert = row.scalar_one_or_none()
+    if not alert:
+        raise HTTPException(status_code=404, detail={"code": "ALERT_NOT_FOUND", "message": "Alert not found"})
+
+    if payload.assigned_to is not None:
+        user_row = await db.execute(
+            select(User).where(User.id == payload.assigned_to, User.org_id == current_user.org_id)
+        )
+        assignee = user_row.scalar_one_or_none()
+        if not assignee:
+            raise HTTPException(status_code=404, detail={"code": "ASSIGNEE_NOT_FOUND", "message": "Assignee not found in organization"})
+
+    alert.assigned_to = payload.assigned_to
+    alert.last_seen_at = datetime.utcnow()
+    db.add(
+        AlertHistory(
+            org_id=current_user.org_id,
+            alert_id=alert.id,
+            action="assignment_update",
+            performed_by=current_user.id,
+            details={"assigned_to": payload.assigned_to},
+        )
+    )
+    await write_audit_event(
+        db,
+        action="alert_assignment_changed",
+        resource_type="alert",
+        resource_id=str(alert.id),
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"assigned_to": payload.assigned_to},
+    )
+    await db.commit()
+
+    return AlertAssignResponse(
+        alert_id=alert.id,
+        assigned_to=alert.assigned_to,
+        updated_at=alert.last_seen_at,
     )
 
 

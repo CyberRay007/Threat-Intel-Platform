@@ -64,6 +64,16 @@ class AlertTriageResponse(BaseModel):
     note_applied: bool
 
 
+class AlertAssignRequest(BaseModel):
+    assigned_to: Optional[int] = Field(default=None, description="User ID to assign alert to; null to unassign")
+
+
+class AlertAssignResponse(BaseModel):
+    alert_id: int
+    assigned_to: Optional[int]
+    updated_at: datetime
+
+
 class AlertInvestigationResponse(BaseModel):
     alert: AlertResponse
     recent_events: List[Dict[str, Any]]
