@@ -10,8 +10,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 import time
 
 from app.core.jwt import decode_access_token
-from app.core.logging import logger
-from app.api import routes_auth, routes_scan, routes_intel, routes_detection, routes_dasboard
+from app.core.logging import logger, reset_log_context, set_log_context
+from app.api import routes_auth, routes_scan, routes_intel, routes_detection, routes_dasboard, routes_search
 
 app = FastAPI(title="Threat Intel Platform")
 
@@ -49,6 +49,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 		started = time.time()
 		request.state.request_id = str(uuid.uuid4())
 		request.state.org_id = None
+		log_tokens = None
 		auth_header = request.headers.get("authorization", "")
 		if auth_header.lower().startswith("bearer "):
 			token = auth_header.split(" ", 1)[1].strip()
@@ -63,64 +64,65 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 						401,
 						request_id=request.state.request_id,
 					)
+		log_tokens = set_log_context(request_id=request.state.request_id, org_id=str(request.state.org_id) if request.state.org_id else None)
+		try:
+			response = await call_next(request)
 
-		response = await call_next(request)
+			# Enforce a consistent success envelope for JSON API responses.
+			if (
+				response.status_code < 400
+				and response.media_type == "application/json"
+				and request.url.path not in {"/openapi.json", "/docs", "/redoc"}
+			):
+				chunks = []
+				async for chunk in response.body_iterator:
+					chunks.append(chunk)
+				raw = b"".join(chunks)
+				try:
+					payload = json.loads(raw.decode("utf-8")) if raw else None
+				except Exception:
+					payload = None
 
-		# Enforce a consistent success envelope for JSON API responses.
-		if (
-			response.status_code < 400
-			and response.media_type == "application/json"
-			and request.url.path not in {"/openapi.json", "/docs", "/redoc"}
-		):
-			chunks = []
-			async for chunk in response.body_iterator:
-				chunks.append(chunk)
-			raw = b"".join(chunks)
-			try:
-				payload = json.loads(raw.decode("utf-8")) if raw else None
-			except Exception:
-				payload = None
-
-			already_enveloped = isinstance(payload, dict) and {"data", "error", "meta"}.issubset(payload.keys())
-			headers = dict(response.headers)
-			headers.pop("content-length", None)
-			headers["X-Request-ID"] = request.state.request_id
-			if already_enveloped:
-				meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-				meta["request_id"] = request.state.request_id
-				payload["meta"] = meta
-				response = JSONResponse(
-					status_code=response.status_code,
-					content=payload,
-					headers=headers,
-				)
+				already_enveloped = isinstance(payload, dict) and {"data", "error", "meta"}.issubset(payload.keys())
+				headers = dict(response.headers)
+				headers.pop("content-length", None)
+				headers["X-Request-ID"] = request.state.request_id
+				if already_enveloped:
+					meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+					meta["request_id"] = request.state.request_id
+					payload["meta"] = meta
+					response = JSONResponse(
+						status_code=response.status_code,
+						content=payload,
+						headers=headers,
+					)
+				else:
+					response = JSONResponse(
+						status_code=response.status_code,
+						content={
+							"data": payload,
+							"error": None,
+							"meta": {"request_id": request.state.request_id},
+						},
+						headers=headers,
+					)
 			else:
-				response = JSONResponse(
-					status_code=response.status_code,
-					content={
-						"data": payload,
-						"error": None,
-						"meta": {"request_id": request.state.request_id},
-					},
-					headers=headers,
-				)
-		else:
-			response.headers["X-Request-ID"] = request.state.request_id
-		latency_ms = round((time.time() - started) * 1000, 2)
-		logger.info(
-			"http_request",
-			extra={
-				"extra_payload": {
-					"request_id": request.state.request_id,
-					"path": request.url.path,
-					"method": request.method,
-					"status_code": response.status_code,
-					"latency_ms": latency_ms,
-					"org_id": request.state.org_id,
-				}
-			},
-		)
-		return response
+				response.headers["X-Request-ID"] = request.state.request_id
+			latency_ms = round((time.time() - started) * 1000, 2)
+			logger.info(
+				"http_request",
+				extra={
+					"extra_payload": {
+						"path": request.url.path,
+						"method": request.method,
+						"status_code": response.status_code,
+						"latency_ms": latency_ms,
+					}
+				},
+			)
+			return response
+		finally:
+			reset_log_context(log_tokens)
 
 
 app.add_middleware(RequestContextMiddleware)
@@ -141,11 +143,13 @@ app.include_router(routes_scan.router, prefix="/scans")
 app.include_router(routes_intel.router, prefix="/api")
 app.include_router(routes_detection.router, prefix="/api")
 app.include_router(routes_dasboard.router, prefix="/api")
+app.include_router(routes_search.router, prefix="/api")
 app.include_router(routes_auth.router, prefix="/api/v1/auth")
 app.include_router(routes_scan.router, prefix="/api/v1/scans")
 app.include_router(routes_intel.router, prefix="/api/v1")
 app.include_router(routes_detection.router, prefix="/api/v1")
 app.include_router(routes_dasboard.router, prefix="/api/v1")
+app.include_router(routes_search.router, prefix="/api/v1")
 
 
 # Keep interactive docs focused on the core analyst flow.

@@ -5,6 +5,7 @@ import csv
 import gzip
 import json
 import re
+import asyncio
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -306,6 +307,21 @@ def _chunks(items: List[Tuple[str, str]], size: int) -> Iterable[List[Tuple[str,
 def _row_chunks(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+async def _enqueue_ioc_index_batches(org_id, identities: List[Tuple[str, str]]) -> None:
+    if not identities:
+        return
+    unique = sorted({(canonicalize_ioc_type(ioc_type), value) for ioc_type, value in identities})
+    from app.tasks.celery_worker import celery_app
+
+    for batch in _chunks(unique, 250):
+        payload = [[ioc_type, value] for ioc_type, value in batch]
+        await asyncio.to_thread(
+            celery_app.send_task,
+            "app.tasks.celery_worker.bulk_index_iocs_task",
+            args=[str(org_id), payload, None],
+        )
 
 
 async def _get_or_create_default_org_id(db: AsyncSession):
@@ -629,6 +645,7 @@ async def ingest_source(
             result.error_message = f"relationship_enrichment_failed: {rel_exc}"
         await _update_feed_health(db, source, success=True)
         await db.commit()
+        await _enqueue_ioc_index_batches(org_id=org_id, identities=normalized)
         return result
     except Exception as exc:
         await db.rollback()

@@ -75,6 +75,48 @@ def process_detection_backlog_task(limit: int = 100):
 	return run_backlog(limit=limit)
 
 
+@celery_app.task(
+	name="app.tasks.celery_worker.index_ioc_task",
+	bind=True,
+	autoretry_for=(Exception,),
+	retry_backoff=True,
+	retry_jitter=True,
+	retry_kwargs={"max_retries": 5},
+)
+def index_ioc_task(self, ioc_id: int, org_id: str, request_id: str | None = None):
+	from app.tasks.search_tasks import run_index_ioc_task
+
+	return run_index_ioc_task(ioc_id=ioc_id, org_id=org_id, request_id=request_id)
+
+
+@celery_app.task(
+	name="app.tasks.celery_worker.bulk_index_iocs_task",
+	bind=True,
+	autoretry_for=(Exception,),
+	retry_backoff=True,
+	retry_jitter=True,
+	retry_kwargs={"max_retries": 5},
+)
+def bulk_index_iocs_task(self, org_id: str, identities: list[list[str]], request_id: str | None = None):
+	from app.tasks.search_tasks import run_bulk_index_iocs_task
+
+	return run_bulk_index_iocs_task(org_id=org_id, identities=identities, request_id=request_id)
+
+
+@celery_app.task(
+	name="app.tasks.celery_worker.delete_ioc_document_task",
+	bind=True,
+	autoretry_for=(Exception,),
+	retry_backoff=True,
+	retry_jitter=True,
+	retry_kwargs={"max_retries": 5},
+)
+def delete_ioc_document_task(self, ioc_id: int, org_id: str, request_id: str | None = None):
+	from app.tasks.search_tasks import run_delete_ioc_document_task
+
+	return run_delete_ioc_document_task(ioc_id=ioc_id, org_id=org_id, request_id=request_id)
+
+
 @celery_app.task(name="app.tasks.celery_worker.check_feed_staleness_task")
 def check_feed_staleness_task():
 	from app.tasks.intel_tasks import check_feed_staleness_all

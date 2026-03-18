@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 from typing import Optional
 import csv
@@ -15,6 +16,7 @@ from app.dependencies import get_current_user, require_permission
 from app.core.entitlements import allowed_feed_sources, require_entitlement, require_feature
 from app.core.audit import write_audit_event
 from app.utils.errors import E, api_error
+from app.tasks.celery_worker import celery_app
 from app.schemas.intel_schema import (
     IOCCreate,
     IOCResponse,
@@ -525,6 +527,7 @@ async def intel_dashboard(
 @router.post("/intel/ioc", response_model=IOCResponse, status_code=201, summary="Create a new IOC")
 async def create_ioc(
     payload: IOCCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("intel:write")),
 ):
@@ -552,6 +555,22 @@ async def create_ioc(
     db.add(ioc)
     await db.commit()
     await db.refresh(ioc)
+    await write_audit_event(
+        db,
+        action="ioc_created",
+        resource_type="ioc",
+        resource_id=str(ioc.id),
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"type": "file_hash" if ioc.type == "hash" else ioc.type, "value": ioc.value},
+    )
+    await db.commit()
+    await asyncio.to_thread(
+        celery_app.send_task,
+        "app.tasks.celery_worker.index_ioc_task",
+        args=[ioc.id, str(current_user.org_id), getattr(request.state, "request_id", None)],
+    )
     return ioc
 
 
@@ -647,6 +666,7 @@ async def get_ioc_relationships(
 async def update_ioc(
     ioc_id: int,
     payload: IOCUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("intel:write")),
 ):
@@ -661,14 +681,32 @@ async def update_ioc(
         ioc.threat_actor_id = payload.threat_actor_id
     if payload.source is not None:
         ioc.source = payload.source
+    ioc.last_seen = datetime.utcnow()
     await db.commit()
     await db.refresh(ioc)
+    await write_audit_event(
+        db,
+        action="ioc_updated",
+        resource_type="ioc",
+        resource_id=str(ioc.id),
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"source": ioc.source, "threat_actor_id": ioc.threat_actor_id},
+    )
+    await db.commit()
+    await asyncio.to_thread(
+        celery_app.send_task,
+        "app.tasks.celery_worker.index_ioc_task",
+        args=[ioc.id, str(current_user.org_id), getattr(request.state, "request_id", None)],
+    )
     return ioc
 
 
 @router.delete("/intel/ioc/{ioc_id}", status_code=204, summary="Delete an IOC")
 async def delete_ioc(
     ioc_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("intel:write")),
 ):
@@ -676,8 +714,24 @@ async def delete_ioc(
     ioc = row.scalar_one_or_none()
     if not ioc:
         raise HTTPException(status_code=404, detail="IOC not found")
+    deleted_org_id = str(ioc.org_id)
+    await write_audit_event(
+        db,
+        action="ioc_deleted",
+        resource_type="ioc",
+        resource_id=str(ioc.id),
+        org_id=ioc.org_id,
+        user_id=current_user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"type": "file_hash" if ioc.type == "hash" else ioc.type, "value": ioc.value},
+    )
     await db.delete(ioc)
     await db.commit()
+    await asyncio.to_thread(
+        celery_app.send_task,
+        "app.tasks.celery_worker.delete_ioc_document_task",
+        args=[ioc_id, deleted_org_id, getattr(request.state, "request_id", None)],
+    )
 
 
 # ---------------------------------------------------------------------------
