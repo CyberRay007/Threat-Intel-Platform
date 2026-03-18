@@ -1,376 +1,272 @@
-"""
-Export endpoints for search results and IOCs.
+from __future__ import annotations
 
-Supports:
-- STIX 2.1 export (JSON-LD format)
-- TAXII 2.1 integration (collections)
-- JSON export (custom format)
-- CSV export (for analysts and Excel)
-"""
-
+import csv
+import hashlib
+import io
+import json
 from datetime import datetime
-from typing import List, Optional
-from uuid import UUID
+from typing import Optional
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.entitlements import require_entitlement
+from app.database.models import IOC, ThreatActor, User
 from app.database.session import get_db
-from app.core.security import get_current_user
-from app.core.entitlements import require_entitlement, require_permission
-from app.models import User
+from app.dependencies import require_permission
+from app.services.integrations.elastic import ElasticAdapter
+from app.services.integrations.splunk import SplunkAdapter
 from app.services.search_service import search_iocs
-from app.database.models import IOC, ThreatActor
-
-router = APIRouter(prefix="/api/v1/export", tags=["export"])
 
 
-# ==============================================================================
-# STIX 2.1 Export
-# ==============================================================================
-
-def _ioc_to_stix_observable(ioc: IOC, threat_actor: Optional[ThreatActor] = None) -> dict:
-    """Convert IOC record to STIX Observable object."""
-    
-    # Map IOC types to STIX observable types
-    stix_type_mapping = {
-        "domain": {"type": "domain-name", "value_field": "value"},
-        "ip": {"type": "ipv4-addr", "value_field": "value"},
-        "url": {"type": "url", "value_field": "value"},
-        "file_hash": {"type": "file", "value_field": "hashes.MD5"},  # Simplified
-    }
-    
-    stix_config = stix_type_mapping.get(ioc.type, {"type": "x-custom-ioc", "value_field": "value"})
-    
-    observable = {
-        "id": f"observable--{ioc.id}",
-        "type": "observed-data",
-        "created": ioc.first_seen.isoformat() if ioc.first_seen else datetime.utcnow().isoformat(),
-        "modified": ioc.last_seen.isoformat() if ioc.last_seen else datetime.utcnow().isoformat(),
-        "object_refs": [f"observable--{ioc.id}-1"],
-    }
-    
-    # Add objects
-    objects = {
-        "0": {
-            "type": stix_config["type"],
-            "value": ioc.value,
-        }
-    }
-    observable["objects"] = objects
-    
-    return observable
+router = APIRouter(tags=["export"])
 
 
-def _ioc_to_stix_indicator(ioc: IOC, threat_actor: Optional[ThreatActor] = None) -> dict:
-    """Convert IOC to STIX Indicator object."""
-    
-    # Build pattern (simplified STIX pattern language)
-    # Example: [domain-name:value = 'malware.com']
-    
-    stix_pattern_mapping = {
+def _stix_indicator_id(org_id: str, ioc_id: int) -> str:
+    # Deterministic STIX id for stable downstream dedupe.
+    digest = hashlib.sha256(f"{org_id}:{ioc_id}".encode("utf-8")).hexdigest()[:32]
+    return f"indicator--{digest}"
+
+
+def _ioc_to_stix_indicator(ioc: IOC) -> dict:
+    pattern_map = {
         "domain": "[domain-name:value",
         "ip": "[ipv4-addr:value",
         "url": "[url:value",
         "file_hash": "[file:hashes.MD5",
     }
-    
-    pattern_prefix = stix_pattern_mapping.get(ioc.type, "[x-custom-ioc:value")
-    pattern = f"{pattern_prefix} = '{ioc.value}']"
-    
-    indicator = {
-        "id": f"indicator--{UUID(int=ioc.id).hex}",
+    prefix = pattern_map.get(ioc.type, "[x-tip-ioc:value")
+    pattern = f"{prefix} = '{ioc.value}']"
+
+    ts_created = (ioc.first_seen or datetime.utcnow()).isoformat()
+    ts_modified = (ioc.last_seen or datetime.utcnow()).isoformat()
+
+    return {
         "type": "indicator",
-        "created": ioc.first_seen.isoformat() if ioc.first_seen else datetime.utcnow().isoformat(),
-        "modified": ioc.last_seen.isoformat() if ioc.last_seen else datetime.utcnow().isoformat(),
-        "name": f"{ioc.type.upper()}: {ioc.value}",
-        "description": f"Confidence: {ioc.confidence}, Source Reliability: {ioc.source_reliability}, Source: {ioc.source}",
+        "spec_version": "2.1",
+        "id": _stix_indicator_id(str(ioc.org_id), ioc.id),
+        "created": ts_created,
+        "modified": ts_modified,
+        "name": f"{ioc.type}:{ioc.value}",
+        "description": f"source={ioc.source or 'unknown'} confidence={ioc.confidence}",
         "pattern": pattern,
         "pattern_type": "stix",
-        "pattern_version": "2.1",
-        "valid_from": ioc.first_seen.isoformat() if ioc.first_seen else datetime.utcnow().isoformat(),
+        "valid_from": ts_created,
         "labels": ["malicious-activity"],
     }
-    
-    # Add relationships to threat actor if applicable
-    if threat_actor:
-        indicator["created_by_ref"] = f"identity--{threat_actor.id}"
-    
-    return indicator
 
 
-@router.get("/stix2.1/indicators", name="export_stix21_indicators")
+@router.get("/export/stix2.1/indicators")
 async def export_stix21_indicators(
-    current_user: User = Depends(get_current_user),
+    q: Optional[str] = Query(default=None),
+    ioc_type: Optional[str] = Query(default=None, alias="type"),
+    min_confidence: Optional[float] = Query(default=None, ge=0.0, le=1.0),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=500, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
-    q: str = Query("", description="Search query"),
-    ioc_type: Optional[str] = Query(None, alias="type", description="Filter by IOC type"),
-    min_confidence: Optional[float] = Query(None, description="Minimum confidence level"),
+    current_user: User = Depends(require_permission("intel:read")),
+    _: User = Depends(require_entitlement("stix_export")),
 ):
-    """
-    Export search results as STIX 2.1 Indicators.
-    
-    Returns STIX 2.1 JSON-LD format suitable for threat intelligence sharing.
-    Can be consumed by SIEM/SOAR platforms and other threat intelligence tools.
-    """
-    
-    # Check entitlements
-    require_permission("intel:read")(current_user)
-    require_entitlement("search_intelligence")(current_user)
-    
-    # Search IOCs
-    search_results = await search_iocs(
-        db=db,
+    search_result = await search_iocs(
         org_id=str(current_user.org_id),
-        query=q,
+        q=q,
         ioc_type=ioc_type,
-        min_confidence=min_confidence
+        source=None,
+        min_confidence=min_confidence,
+        first_seen_after=None,
+        last_seen_before=None,
+        page=page,
+        limit=limit,
     )
-    
-    # Build STIX bundle
-    indicators = []
-    identities = set()
-    
-    for result in search_results.get("results", []):
-        ioc_id = result["id"]
-        threat_actor_id = result.get("threat_actor_id")
-        
-        # Fetch full IOC
-        ioc = await db.get(IOC, ioc_id)
-        if not ioc:
-            continue
-        
-        threat_actor = None
-        if threat_actor_id:
-            threat_actor = await db.get(ThreatActor, threat_actor_id)
-            if threat_actor:
-                identities.add(threat_actor.id)
-        
-        indicator = _ioc_to_stix_indicator(ioc, threat_actor)
-        indicators.append(indicator)
-    
-    # Build STIX identity objects for threat actors
-    identity_objects = []
-    for actor_id in identities:
-        actor = await db.get(ThreatActor, actor_id)
-        if actor:
-            identity = {
-                "id": f"identity--{actor_id}",
-                "type": "identity",
-                "created": datetime.utcnow().isoformat(),
-                "modified": datetime.utcnow().isoformat(),
-                "name": actor.name,
-                "description": actor.description,
-                "identity_class": "threat-actor",
-            }
-            identity_objects.append(identity)
-    
-    # Create STIX bundle
+
+    ids = [row["id"] for row in search_result.get("items", [])]
+    if not ids:
+        return {"type": "bundle", "id": f"bundle--{uuid4().hex}", "objects": []}
+
+    db_rows = await db.execute(select(IOC).where(IOC.org_id == current_user.org_id, IOC.id.in_(ids)))
+    iocs = db_rows.scalars().all()
+
     bundle = {
         "type": "bundle",
-        "id": f"bundle--{UUID().hex}",
-        "objects": identity_objects + indicators,
+        "id": f"bundle--{uuid4().hex}",
+        "objects": [_ioc_to_stix_indicator(ioc) for ioc in iocs],
     }
-    
     return bundle
 
 
-# ==============================================================================
-# JSON Export
-# ==============================================================================
-
-@router.get("/json")
+@router.get("/export/json")
 async def export_json(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    q: str = Query("", description="Search query"),
-    ioc_type: Optional[str] = Query(None, alias="type"),
-    min_confidence: Optional[float] = Query(None),
-    include_metadata: bool = Query(True, description="Include full IOC metadata"),
+    q: Optional[str] = Query(default=None),
+    ioc_type: Optional[str] = Query(default=None, alias="type"),
+    min_confidence: Optional[float] = Query(default=None, ge=0.0, le=1.0),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=1000, ge=1, le=2000),
+    current_user: User = Depends(require_permission("intel:read")),
+    _: User = Depends(require_entitlement("ioc_export_json")),
 ):
-    """
-    Export search results as JSON.
-    
-    Includes:
-    - IOC details (type, value, confidence, source)
-    - Associated threat actors
-    - Tags and relationships
-    - Timeline (first_seen, last_seen)
-    """
-    
-    require_permission("intel:read")(current_user)
-    require_entitlement("search_intelligence")(current_user)
-    
-    # Search IOCs
-    search_results = await search_iocs(
-        db=db,
+    result = await search_iocs(
         org_id=str(current_user.org_id),
-        query=q,
+        q=q,
         ioc_type=ioc_type,
-        min_confidence=min_confidence
+        source=None,
+        min_confidence=min_confidence,
+        first_seen_after=None,
+        last_seen_before=None,
+        page=page,
+        limit=limit,
     )
-    
-    results = []
-    for ioc_data in search_results.get("results", []):
-        if include_metadata:
-            results.append(ioc_data)
-        else:
-            # Minimal format
-            results.append({
-                "id": ioc_data["id"],
-                "type": ioc_data["type"],
-                "value": ioc_data["value"],
-                "confidence": ioc_data["confidence"],
-            })
-    
     return {
         "meta": {
-            "export_date": datetime.utcnow().isoformat(),
             "org_id": str(current_user.org_id),
-            "result_count": len(results),
-            "query_string": q,
+            "exported_at": datetime.utcnow().isoformat(),
+            "total": result.get("total", 0),
+            "page": page,
+            "limit": limit,
         },
-        "data": results,
+        "data": result.get("items", []),
+        "aggregations": result.get("aggregations", {}),
     }
 
 
-# ==============================================================================
-# CSV Export
-# ==============================================================================
-
-@router.get("/csv")
+@router.get("/export/csv")
 async def export_csv(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    q: str = Query("", description="Search query"),
-    ioc_type: Optional[str] = Query(None, alias="type"),
+    q: Optional[str] = Query(default=None),
+    ioc_type: Optional[str] = Query(default=None, alias="type"),
+    min_confidence: Optional[float] = Query(default=None, ge=0.0, le=1.0),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=5000, ge=1, le=10000),
+    current_user: User = Depends(require_permission("intel:read")),
+    _: User = Depends(require_entitlement("ioc_export_csv")),
 ):
-    """
-    Export search results as CSV.
-    
-    Columns: id, type, value, confidence, source, source_reliability, threat_actor, tags, first_seen, last_seen
-    """
-    
-    require_permission("intel:read")(current_user)
-    require_entitlement("search_intelligence")(current_user)
-    
-    search_results = await search_iocs(
-        db=db,
+    result = await search_iocs(
         org_id=str(current_user.org_id),
-        query=q,
-        ioc_type=ioc_type
+        q=q,
+        ioc_type=ioc_type,
+        source=None,
+        min_confidence=min_confidence,
+        first_seen_after=None,
+        last_seen_before=None,
+        page=page,
+        limit=limit,
     )
-    
-    import csv
-    import io
-    
+
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
         fieldnames=[
-            "id", "type", "value", "confidence", "source_reliability",
-            "source", "threat_actor", "tags_list", "first_seen", "last_seen"
-        ]
+            "id",
+            "type",
+            "value",
+            "source",
+            "confidence",
+            "source_reliability",
+            "threat_actor_name",
+            "first_seen",
+            "last_seen",
+            "tags",
+            "relationship_count",
+        ],
     )
     writer.writeheader()
-    
-    for ioc_data in search_results.get("results", []):
-        writer.writerow({
-            "id": ioc_data["id"],
-            "type": ioc_data["type"],
-            "value": ioc_data["value"],
-            "confidence": f"{ioc_data['confidence']:.3f}",
-            "source_reliability": f"{ioc_data['source_reliability']:.3f}",
-            "source": ioc_data["source"],
-            "threat_actor": ioc_data.get("threat_actor_name", "N/A"),
-            "tags_list": ";".join(ioc_data.get("tags", [])),
-            "first_seen": ioc_data["first_seen"],
-            "last_seen": ioc_data["last_seen"],
-        })
-    
-    return {
-        "content_type": "text/csv",
-        "body": output.getvalue(),
-        "filename": f"ioc-export-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.csv"
-    }
+    for row in result.get("items", []):
+        writer.writerow(
+            {
+                "id": row.get("id"),
+                "type": row.get("type"),
+                "value": row.get("value"),
+                "source": row.get("source"),
+                "confidence": row.get("confidence"),
+                "source_reliability": row.get("source_reliability"),
+                "threat_actor_name": row.get("threat_actor_name") or "",
+                "first_seen": row.get("first_seen"),
+                "last_seen": row.get("last_seen"),
+                "tags": ";".join(row.get("tags", [])),
+                "relationship_count": row.get("relationship_count", 0),
+            }
+        )
+
+    filename = f"iocs-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.csv"
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
-# ==============================================================================
-# TAXII 2.1 Collections Integration
-# ==============================================================================
-
-class TAXIICollectionDesc(dict):
-    """TAXII 2.1 Collection description object."""
-    pass
-
-
-@router.get("/taxii2.1/discovery", name="taxii_discovery")
-async def taxii_discovery(current_user: User = Depends(get_current_user)):
-    """
-    TAXII 2.1 Server Discovery endpoint.
-    
-    Lists available TAXII collections for IOC sharing.
-    """
-    
-    require_entitlement("search_intelligence")(current_user)
-    
-    return {
-        "title": f"TIP TAXII API - {current_user.organization.name}",
-        "description": "Threat Intelligence Platform TAXII 2.1 API",
-        "contact": "security@example.com",
-        "api_roots": [
-            f"/api/v1/export/taxii2.1/api_roots/{current_user.org_id}"
-        ],
-    }
-
-
-@router.get("/taxii2.1/collections", name="taxii_collections")
-async def taxii_collections(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+@router.get("/export/taxii2.1/discovery")
+async def taxii_discovery(
+    current_user: User = Depends(require_permission("intel:read")),
+    _: User = Depends(require_entitlement("stix_export")),
 ):
-    """
-    TAXII 2.1 Collections endpoint.
-    
-    Returns list of available collections for this organization.
-    """
-    
-    require_entitlement("search_intelligence")(current_user)
-    
+    return {
+        "title": "Threat Intel Platform TAXII",
+        "description": "Tenant-scoped TAXII discovery",
+        "api_roots": [f"/api/v1/export/taxii2.1/api_roots/{current_user.org_id}"],
+    }
+
+
+@router.get("/export/taxii2.1/collections")
+async def taxii_collections(
+    current_user: User = Depends(require_permission("intel:read")),
+    _: User = Depends(require_entitlement("stix_export")),
+):
     return {
         "collections": [
             {
                 "id": "iocs",
                 "title": "Organization IOCs",
-                "description": f"All IOCs for {current_user.organization.name}",
+                "description": "Tenant-isolated IOC collection",
                 "can_read": True,
-                "can_write": current_user.role in ["admin"],
-            },
-            {
-                "id": "iocs_high_confidence",
-                "title": "High Confidence IOCs",
-                "description": "IOCs with >= 0.8 confidence",
-                "can_read": True,
-                "can_write": False,
-            },
+                "can_write": current_user.role == "admin",
+            }
         ]
     }
 
 
-@router.post("/taxii2.1/collections/iocs/objects", name="taxii_add_objects")
-async def taxii_add_objects(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+@router.post("/export/partners/siem/{provider}")
+async def push_to_siem(
+    provider: str,
+    q: Optional[str] = Query(default=None),
+    ioc_type: Optional[str] = Query(default=None, alias="type"),
+    min_confidence: Optional[float] = Query(default=0.7, ge=0.0, le=1.0),
+    limit: int = Query(default=500, ge=1, le=5000),
+    current_user: User = Depends(require_permission("intel:read")),
+    _: User = Depends(require_entitlement("siem_push")),
 ):
-    """
-    TAXII 2.1 Add Objects endpoint.
-    
-    Ingest STIX objects from external TAXII servers.
-    """
-    
-    require_permission("intel:write")(current_user)
-    
+    result = await search_iocs(
+        org_id=str(current_user.org_id),
+        q=q,
+        ioc_type=ioc_type,
+        source=None,
+        min_confidence=min_confidence,
+        first_seen_after=None,
+        last_seen_before=None,
+        page=1,
+        limit=limit,
+    )
+    payload = result.get("items", [])
+
+    provider_name = provider.strip().lower()
+    if provider_name == "splunk":
+        adapter = SplunkAdapter()
+    elif provider_name == "elastic":
+        adapter = ElasticAdapter()
+    else:
+        return {"success": False, "error": f"Unsupported provider '{provider_name}'"}
+
+    health = adapter.health_check()
+    if not health:
+        return {"success": False, "error": f"{provider_name} integration health check failed"}
+
+    push_result = adapter.push_iocs(payload)
     return {
-        "success": 0,
-        "failures": [],
+        "provider": provider_name,
+        "success": push_result.success,
+        "pushed": push_result.pushed,
+        "failed": push_result.failed,
+        "error": push_result.error,
+        "total_selected": len(payload),
     }

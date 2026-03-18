@@ -348,3 +348,54 @@ Immediate next sprint recommendation (2 weeks)
 • Feed health persistence (last_success, last_failure, failure_count, freshness)
 • Metrics endpoint and baseline operational dashboard
 • API key lifecycle endpoints with audit events
+
+Search and Intelligence Retrieval Layer (2026-03-18)
+This sprint adds production-oriented search, export, and observability foundations.
+
+Implemented
+• OpenSearch backend integration with tenant-safe IOC indexing
+• Search API endpoint with pagination, filtering, and aggregations:
+     - GET /api/v1/search/iocs
+• Async indexing pipeline from IOC CRUD and feed ingestion to OpenSearch
+• Request tracing across API -> audit -> Celery -> indexing logs
+• Export endpoints:
+     - GET /api/v1/export/json
+     - GET /api/v1/export/csv
+     - GET /api/v1/export/stix2.1/indicators
+     - GET /api/v1/export/taxii2.1/discovery
+     - GET /api/v1/export/taxii2.1/collections
+     - POST /api/v1/export/partners/siem/{provider} (splunk|elastic)
+• Alerting service with Slack/email/webhook sinks and request_id propagation
+
+Tenant Isolation and Entitlements
+• Search queries enforce org_id filters at query construction time
+• Export routes use role permission checks and plan entitlement gates
+• Free plan denied for STIX export (verified in integration tests)
+
+Search Load Testing
+Load benchmark script:
+• tests/load/load_search_benchmark.py
+
+Example:
+Copy code
+
+python tests/load/load_search_benchmark.py \
+  --database-url postgresql+asyncpg://threat_user:password@localhost:5432/threat_intel_db \
+  --iocs 100000 \
+  --warmup 5 \
+  --queries 50
+
+CI/CD Coverage
+GitHub Actions workflow:
+• .github/workflows/backend-search.yml
+
+CI validates:
+• OpenSearch service startup
+• Integration tests:
+     - tests/integration/test_ioc_search_trace.py
+     - tests/integration/test_export_entitlements.py
+• Docker compose validity for local dev stack
+
+Operational Runbooks
+• docs/runbooks/search-operations.md
+• docs/runbooks/alert-handling.md
