@@ -14,3 +14,8 @@ OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD", "")
 OPENSEARCH_VERIFY_SSL = os.getenv("OPENSEARCH_VERIFY_SSL", "false").lower() == "true"
 OPENSEARCH_TIMEOUT = int(os.getenv("OPENSEARCH_TIMEOUT", "5"))
 OPENSEARCH_IOC_INDEX = os.getenv("OPENSEARCH_IOC_INDEX", "tip-iocs-v1")
+
+# Alerting configuration
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+EMAIL_RECIPIENTS = os.getenv("EMAIL_RECIPIENTS", "").split(",") if os.getenv("EMAIL_RECIPIENTS") else []
+WEBHOOK_URLS = os.getenv("WEBHOOK_URLS", "").split(",") if os.getenv("WEBHOOK_URLS") else []

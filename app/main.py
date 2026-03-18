@@ -12,6 +12,7 @@ import time
 from app.core.jwt import decode_access_token
 from app.core.logging import logger, reset_log_context, set_log_context
 from app.api import routes_auth, routes_scan, routes_intel, routes_detection, routes_dasboard, routes_search
+from app.api import routes_auth, routes_scan, routes_intel, routes_detection, routes_dasboard, routes_search, routes_export
 
 app = FastAPI(title="Threat Intel Platform")
 
@@ -144,12 +145,14 @@ app.include_router(routes_intel.router, prefix="/api")
 app.include_router(routes_detection.router, prefix="/api")
 app.include_router(routes_dasboard.router, prefix="/api")
 app.include_router(routes_search.router, prefix="/api")
+app.include_router(routes_export.router, prefix="/api")
 app.include_router(routes_auth.router, prefix="/api/v1/auth")
 app.include_router(routes_scan.router, prefix="/api/v1/scans")
 app.include_router(routes_intel.router, prefix="/api/v1")
 app.include_router(routes_detection.router, prefix="/api/v1")
 app.include_router(routes_dasboard.router, prefix="/api/v1")
 app.include_router(routes_search.router, prefix="/api/v1")
+app.include_router(routes_export.router, prefix="/api/v1")
 
 
 # Keep interactive docs focused on the core analyst flow.
