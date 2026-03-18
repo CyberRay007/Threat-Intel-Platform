@@ -15,7 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.database.models import IOC, IOCRelationship, IOCGraphRelationship, ThreatActor, MalwareFamily, Campaign, Organization
+from app.database.models import IOC, IOCRelationship, IOCGraphRelationship, ThreatActor, MalwareFamily, Campaign, Organization, FeedHealth
 
 
 SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
@@ -347,6 +347,46 @@ async def _insert_missing_iocs(db: AsyncSession, source: str, indicators: List[T
     return inserted
 
 
+def _compute_freshness(last_success_at: Optional[datetime]) -> float:
+    """Return freshness score in [0.0, 1.0] based on age since last success."""
+    if not last_success_at:
+        return 0.0
+    age_seconds = max(0.0, (datetime.utcnow() - last_success_at).total_seconds())
+    # Fresh for first hour; decays linearly to zero by 24 hours.
+    if age_seconds <= 3600:
+        return 1.0
+    if age_seconds >= 86400:
+        return 0.0
+    return round(1.0 - ((age_seconds - 3600) / (86400 - 3600)), 4)
+
+
+async def _update_feed_health(
+    db: AsyncSession,
+    source: str,
+    *,
+    success: bool,
+    error_message: Optional[str] = None,
+) -> None:
+    row = await db.execute(select(FeedHealth).where(FeedHealth.source == source))
+    health = row.scalar_one_or_none()
+    if health is None:
+        health = FeedHealth(source=source)
+        db.add(health)
+        await db.flush()
+
+    now = datetime.utcnow()
+    if success:
+        health.last_success_at = now
+        health.success_count = int((health.success_count or 0) + 1)
+    else:
+        health.last_failure_at = now
+        health.error_count = int((health.error_count or 0) + 1)
+        health.last_failure_message = (error_message or "")[:1000]
+
+    health.freshness_score = _compute_freshness(health.last_success_at)
+    health.updated_at = now
+
+
 async def _upsert_named_entity(db: AsyncSession, entity_type: str, name: str, org_id) -> int:
     if entity_type == "threat_actor":
         stmt = (
@@ -546,6 +586,8 @@ async def ingest_source(
     try:
         if FEEDS[source].get("requires_api_key") == "true" and not otx_api_key:
             result.error_message = "skipped_missing_otx_api_key"
+            await _update_feed_health(db, source, success=False, error_message=result.error_message)
+            await db.commit()
             return result
 
         raw_items = fetch_feed(source=source, timeout=max(timeout, 45), otx_api_key=otx_api_key)
@@ -585,12 +627,16 @@ async def ingest_source(
         except Exception as rel_exc:
             # Keep IOC ingestion successful even if relationship enrichment fails.
             result.error_message = f"relationship_enrichment_failed: {rel_exc}"
+        await _update_feed_health(db, source, success=True)
         await db.commit()
         return result
     except Exception as exc:
         await db.rollback()
         result.errors = 1
         result.error_message = str(exc)
+        # Retry inside same session to persist failure metadata.
+        await _update_feed_health(db, source, success=False, error_message=result.error_message)
+        await db.commit()
         return result
 
 

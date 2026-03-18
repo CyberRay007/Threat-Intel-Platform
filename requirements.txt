@@ -9,6 +9,7 @@ passlib
 python-jose
 requests
 pytest
+pytest-asyncio
 python-multipart
 alembic
 argon2-cffi

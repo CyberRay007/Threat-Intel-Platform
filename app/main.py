@@ -1,6 +1,9 @@
-from fastapi import FastAPI
+import uuid
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import time
@@ -10,6 +13,32 @@ from app.core.logging import logger
 from app.api import routes_auth, routes_scan, routes_intel, routes_detection, routes_dasboard
 
 app = FastAPI(title="Threat Intel Platform")
+
+
+def _error_envelope(code: str, message: str, status_code: int) -> JSONResponse:
+	body = {
+		"data": None,
+		"error": {
+			"code": code,
+			"message": message,
+		},
+		"meta": {
+			"request_id": str(uuid.uuid4()),
+		},
+	}
+	return JSONResponse(status_code=status_code, content=body)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+	if isinstance(exc.detail, dict) and "code" in exc.detail and "message" in exc.detail:
+		return _error_envelope(exc.detail["code"], exc.detail["message"], exc.status_code)
+	return _error_envelope("HTTP_ERROR", str(exc.detail), exc.status_code)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+	return _error_envelope("VALIDATION_ERROR", "Request validation failed", 422)
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -24,7 +53,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 				request.state.org_id = payload.get("org_id")
 			except Exception:
 				if request.url.path.startswith("/api") or request.url.path.startswith("/scans"):
-					return JSONResponse(status_code=401, content={"detail": "invalid token"})
+					return _error_envelope("AUTH_TOKEN_INVALID", "Authentication token is invalid or expired.", 401)
 
 		response = await call_next(request)
 		latency_ms = round((time.time() - started) * 1000, 2)

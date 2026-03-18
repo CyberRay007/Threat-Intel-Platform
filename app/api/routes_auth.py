@@ -14,6 +14,8 @@ from app.core.security import hash_password, verify_password
 from app.core.jwt import create_access_token
 from app.core.logging import logger
 from app.dependencies import get_current_user, require_permission
+from app.core.entitlements import check_quota
+from app.utils.errors import E, api_error
 from app.schemas.auth_schema import APIKeyCreateRequest, APIKeyCreateResponse, APIKeyListItem, Token, UserCreate, UserResponse
 
 router = APIRouter()
@@ -93,6 +95,10 @@ async def create_api_key(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("admin:all")),
 ):
+    org_row = await db.execute(select(Organization).where(Organization.id == current_user.org_id))
+    org = org_row.scalar_one_or_none()
+    await check_quota(db, current_user.org_id, "api_keys", plan_name=(org.plan if org else "free"))
+
     raw_key = f"tip_{secrets.token_urlsafe(32)}"
     key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
     record = APIKey(
@@ -142,10 +148,39 @@ async def revoke_api_key(
     row = await db.execute(select(APIKey).where(APIKey.id == key_id, APIKey.org_id == current_user.org_id))
     item = row.scalar_one_or_none()
     if not item:
-        raise HTTPException(status_code=404, detail="api key not found")
+        raise api_error(E.API_KEY_NOT_FOUND)
     logger.info(
         "api_key_revoked",
         extra={"extra_payload": {"event": "api_key_revoked", "api_key_id": item.id, "org_id": str(item.org_id), "revoked_by": current_user.id}},
     )
     await db.delete(item)
     await db.commit()
+
+
+@router.post("/api-keys/{key_id}/rotate", response_model=APIKeyCreateResponse)
+async def rotate_api_key(
+    key_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("admin:all")),
+):
+    row = await db.execute(select(APIKey).where(APIKey.id == key_id, APIKey.org_id == current_user.org_id))
+    item = row.scalar_one_or_none()
+    if not item:
+        raise api_error(E.API_KEY_NOT_FOUND)
+
+    raw_key = f"tip_{secrets.token_urlsafe(32)}"
+    item.key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    item.last_used = None
+    await db.commit()
+    await db.refresh(item)
+    logger.info(
+        "api_key_rotated",
+        extra={"extra_payload": {"event": "api_key_rotated", "api_key_id": item.id, "org_id": str(item.org_id), "rotated_by": current_user.id}},
+    )
+
+    return APIKeyCreateResponse(
+        id=item.id,
+        org_id=str(item.org_id),
+        key=raw_key,
+        permissions=item.permissions or [],
+    )

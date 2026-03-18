@@ -38,6 +38,11 @@ celery_app.conf.update(
 			"schedule": 300.0,
 			"args": (200,),
 		},
+		# Check every feed for staleness every 15 minutes.
+		"check-feed-staleness-15m": {
+			"task": "app.tasks.celery_worker.check_feed_staleness_task",
+			"schedule": 900.0,
+		},
 	},
 )
 
@@ -68,3 +73,10 @@ def process_detection_backlog_task(limit: int = 100):
 	from app.tasks.detection_tasks import process_detection_backlog_task as run_backlog
 
 	return run_backlog(limit=limit)
+
+
+@celery_app.task(name="app.tasks.celery_worker.check_feed_staleness_task")
+def check_feed_staleness_task():
+	from app.tasks.intel_tasks import check_feed_staleness_all
+
+	check_feed_staleness_all()

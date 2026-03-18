@@ -6,6 +6,7 @@ from sqlalchemy import select
 from app.database.models import Event
 from app.database.session import AsyncSessionLocal
 from app.services.detection_pipeline import process_event
+from app.core.metrics import record_event_queued, record_event_processed
 
 
 _WORKER_LOOP: asyncio.AbstractEventLoop | None = None
@@ -20,6 +21,7 @@ def _run_in_worker_loop(coro):
 
 
 async def _process_event_by_id(event_id: int) -> Dict[str, Any]:
+    record_event_queued(event_id)
     async with AsyncSessionLocal() as db:
         row = await db.execute(select(Event).where(Event.id == event_id))
         event = row.scalar_one_or_none()
@@ -27,6 +29,7 @@ async def _process_event_by_id(event_id: int) -> Dict[str, Any]:
             return {"event_id": event_id, "status": "not_found"}
 
         await process_event(db, event)
+        record_event_processed(event_id)
         return {"event_id": event_id, "status": "processed"}
 
 

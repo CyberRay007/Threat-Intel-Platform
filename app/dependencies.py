@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional
 import time
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,6 +71,7 @@ def require_permission(permission: str):
 
 async def get_api_client(
     x_api_key: str = Header(default="", alias="X-API-Key"),
+    request: Request = None,
     db: AsyncSession = Depends(get_db),
 ) -> APIKey:
     if not x_api_key:
@@ -99,8 +100,17 @@ async def get_api_client(
 
     api_key.last_used = datetime.utcnow()
     await db.commit()
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if request else "unknown"
+    ) or (str(request.client.host) if request and request.client else "unknown")
     logger.info(
         "api_key_authenticated",
-        extra={"extra_payload": {"event": "api_key_authenticated", "org_id": str(api_key.org_id), "api_key_id": api_key.id}},
+        extra={"extra_payload": {
+            "event": "api_key_authenticated",
+            "org_id": str(api_key.org_id),
+            "api_key_id": api_key.id,
+            "client_ip": client_ip,
+        }},
     )
     return api_key
